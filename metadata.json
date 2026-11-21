@@ -1,0 +1,6 @@
+{
+  "name": "MangaReaderApp",
+  "description": "AMOLED Manga- & Webtoon-Reader mit Multi-Tab-Browser, Bibliothek, Lesezeichen, Verlauf, Nachtfilter, Autoscroll, Pre-Fetching und HTTP-Bilddiagnose.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
