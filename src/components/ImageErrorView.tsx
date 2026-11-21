@@ -2,8 +2,10 @@ import {
   AlertTriangle,
   CloudOff,
   Copy,
+  DatabaseZap,
   Globe,
   Hourglass,
+  ImageOff,
   RefreshCw,
   RotateCcw,
   ShieldAlert,
@@ -18,6 +20,7 @@ interface ImageErrorViewProps {
   retryAttempt: number;
   isAutoRetrying: boolean;
   onRetry: () => void;
+  onCacheBypass?: () => void;
   onRefreshSession: () => void;
   onOpenBrowser: () => void;
   onCopyUrl: (url: string) => void;
@@ -44,6 +47,8 @@ function DiagnosticIcon({ kind, className }: { kind: ImageDiagnostic['kind']; cl
     case 'HTTP_403':
     case 'HTML_CHALLENGE':
       return <ShieldAlert className={className} aria-hidden="true" />;
+    case 'DECODE_ERROR':
+      return <ImageOff className={className} aria-hidden="true" />;
     case 'HTTP_429':
       return <Hourglass className={className} aria-hidden="true" />;
     case 'HTTP_5XX':
@@ -61,13 +66,19 @@ export function ImageErrorView({
   retryAttempt,
   isAutoRetrying,
   onRetry,
+  onCacheBypass,
   onRefreshSession,
   onOpenBrowser,
   onCopyUrl,
 }: ImageErrorViewProps) {
+  const isDecodeError = diagnostic.kind === 'DECODE_ERROR';
+  const isSecurityChallenge = diagnostic.kind === 'HTML_CHALLENGE';
+
   return (
     <div
       data-testid={`image-error-card-${pageIndex}`}
+      data-diagnostic-kind={diagnostic.kind}
+      data-received-content-type={diagnostic.receivedContentType || ''}
       className={`mx-auto my-3 w-full max-w-2xl rounded-2xl border p-5 text-left ${SEVERITY_SURFACE[diagnostic.severity]}`}
     >
       <div className="flex items-start gap-3.5">
@@ -79,8 +90,22 @@ export function ImageErrorView({
             <span className="font-mono-tabular">Seite {pageIndex + 1}</span>
             <span aria-hidden="true">·</span>
             <span className="font-mono-tabular">
-              {diagnostic.httpStatus ? `Status ${diagnostic.httpStatus}` : 'Diagnose'}
+              {isSecurityChallenge
+                ? 'Sicherheits-/CDN-Prüfung'
+                : diagnostic.httpStatus
+                ? `Status ${diagnostic.httpStatus}`
+                : isDecodeError
+                ? 'Null-Bitmap-Diagnose'
+                : 'Diagnose'}
             </span>
+            {diagnostic.receivedContentType && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="font-mono-tabular text-amber-300">
+                  {diagnostic.receivedContentType}
+                </span>
+              </>
+            )}
             {retryAttempt > 0 && (
               <>
                 <span aria-hidden="true">·</span>
@@ -110,12 +135,45 @@ export function ImageErrorView({
       </div>
 
       <div className="mt-4 flex flex-wrap items-center gap-2.5 border-t border-white/10 pt-4">
+        {isSecurityChallenge && diagnostic.suggestOpenBrowser && (
+          <button
+            type="button"
+            data-testid={`image-error-open-browser-btn-${pageIndex}`}
+            onClick={onOpenBrowser}
+            className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[#7C4DFF] px-4 py-2 text-sm font-semibold text-white whitespace-nowrap shrink-0 transition-colors hover:bg-[#6E3FF2] focus-visible:outline-2 focus-visible:outline-[#BB86FC]"
+          >
+            <Globe className="h-4 w-4" aria-hidden="true" />
+            Im Browser öffnen
+          </button>
+        )}
+
+        {diagnostic.suggestCacheBypass && onCacheBypass && (
+          <button
+            type="button"
+            data-testid={`image-error-cache-bypass-btn-${pageIndex}`}
+            onClick={onCacheBypass}
+            className={
+              isDecodeError
+                ? 'inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[#7C4DFF] px-4 py-2 text-sm font-semibold text-white whitespace-nowrap shrink-0 transition-colors hover:bg-[#6E3FF2] focus-visible:outline-2 focus-visible:outline-[#BB86FC]'
+                : 'inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-[#7C4DFF]/50 bg-[#7C4DFF]/15 px-4 py-2 text-sm font-medium text-[#E8DEFF] whitespace-nowrap shrink-0 transition-colors hover:bg-[#7C4DFF]/25 focus-visible:outline-2 focus-visible:outline-[#BB86FC]'
+            }
+          >
+            <DatabaseZap className="h-4 w-4" aria-hidden="true" />
+            Cache-Bypass für dieses Bild
+          </button>
+        )}
+
         <button
           type="button"
+          data-testid={`image-error-retry-btn-${pageIndex}`}
           onClick={onRetry}
-          className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[#7C4DFF] px-4 py-2 text-sm font-medium text-white whitespace-nowrap shrink-0 transition-colors hover:bg-[#6E3FF2] focus-visible:outline-2 focus-visible:outline-[#BB86FC]"
+          className={
+            (isDecodeError && diagnostic.suggestCacheBypass && onCacheBypass) || isSecurityChallenge
+              ? 'inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-medium text-[#ECE9F8] whitespace-nowrap shrink-0 transition-colors hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-[#BB86FC]'
+              : 'inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-[#7C4DFF] px-4 py-2 text-sm font-medium text-white whitespace-nowrap shrink-0 transition-colors hover:bg-[#6E3FF2] focus-visible:outline-2 focus-visible:outline-[#BB86FC]'
+          }
         >
-          <RotateCcw className="h-4 w-4" />
+          <RotateCcw className="h-4 w-4" aria-hidden="true" />
           Erneut versuchen
         </button>
 
@@ -125,19 +183,20 @@ export function ImageErrorView({
             onClick={onRefreshSession}
             className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/15 px-4 py-2 text-sm font-medium text-amber-100 whitespace-nowrap shrink-0 transition-colors hover:bg-amber-500/25 focus-visible:outline-2 focus-visible:outline-[#BB86FC]"
           >
-            <RefreshCw className="h-4 w-4" />
+            <RefreshCw className="h-4 w-4" aria-hidden="true" />
             Sitzung erneuern
           </button>
         )}
 
-        {diagnostic.suggestOpenBrowser && (
+        {!isSecurityChallenge && diagnostic.suggestOpenBrowser && (
           <button
             type="button"
+            data-testid={`image-error-open-browser-btn-${pageIndex}`}
             onClick={onOpenBrowser}
             className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-white/15 bg-white/5 px-4 py-2 text-sm font-medium text-[#ECE9F8] whitespace-nowrap shrink-0 transition-colors hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-[#BB86FC]"
           >
-            <Globe className="h-4 w-4" />
-            Browser
+            <Globe className="h-4 w-4" aria-hidden="true" />
+            Im Browser öffnen
           </button>
         )}
 
@@ -146,7 +205,7 @@ export function ImageErrorView({
           onClick={() => onCopyUrl(imageUrl)}
           className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-white/15 bg-white/5 px-3.5 py-2 text-sm font-medium text-[#CFCBE2] whitespace-nowrap shrink-0 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-[#BB86FC]"
         >
-          <Copy className="h-4 w-4" />
+          <Copy className="h-4 w-4" aria-hidden="true" />
           URL kopieren
         </button>
       </div>

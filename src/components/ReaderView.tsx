@@ -248,6 +248,16 @@ export function ReaderView({
     onNotify('Sitzung erneuert — fehlerhafte Seiten werden mit Cache-Bypass neu geladen.', 'info');
   }, [onNotify]);
 
+  const handleImageCacheBypass = useCallback(
+    (pageIndex: number) => {
+      onNotify(
+        `Seite ${pageIndex + 1}: Cache-Bypass aktiv — Bild wird ohne Cache frisch vom Server geladen…`,
+        'info'
+      );
+    },
+    [onNotify]
+  );
+
   const handleCopyUrl = useCallback(
     async (url: string) => {
       try {
@@ -541,6 +551,7 @@ export function ReaderView({
                   mode="webtoon"
                   zoomScale={zoomScale}
                   onRefreshSession={handleRefreshSession}
+                  onImageCacheBypass={handleImageCacheBypass}
                   onOpenBrowser={onOpenBrowserForChapter}
                   onCopyUrl={handleCopyUrl}
                   onNotify={onNotify}
@@ -654,6 +665,7 @@ export function ReaderView({
               mode="paged"
               zoomScale={zoomScale}
               onRefreshSession={handleRefreshSession}
+              onImageCacheBypass={handleImageCacheBypass}
               onOpenBrowser={onOpenBrowserForChapter}
               onCopyUrl={handleCopyUrl}
               onNotify={onNotify}

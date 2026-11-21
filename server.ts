@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, type GenerateContentResponse } from '@google/genai';
@@ -11,7 +12,11 @@ import {
   extractImageUrlsFromHtml,
   extractTitleFromHtml,
 } from './src/utils/urlChapterAnalyzer.ts';
-import { isHtmlPayload, isValidImageContentType } from './src/utils/imageDiagnostics.ts';
+import {
+  isHtmlPayload,
+  isValidImageContentType,
+  verifyReceivedImageBuffer,
+} from './src/utils/imageDiagnostics.ts';
 import {
   ChapterCacheManager,
   MAX_CACHE_BYTES,
@@ -299,6 +304,33 @@ async function startServer() {
       return;
     }
 
+    // Null-Bitmap / Corrupted Cache simulation: delivers undecodable JPEG bytes until explicit bypassCache=1
+    if (simError === 'null_bitmap') {
+      if (bypassCache) {
+        sendAsset();
+        return;
+      }
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Manga-Diagnostic', 'NULL_BITMAP');
+      res.send(Buffer.from([0xff, 0xd8, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef]));
+      return;
+    }
+
+    // XML / CDN Challenge simulation: delivers HTTP 200 application/xml AccessDenied body instead of image/*
+    if (simError === 'xml_challenge') {
+      if (sessionToken > 0 || bypassCache) {
+        sendAsset();
+        return;
+      }
+      res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-store');
+      res.send(
+        '<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>CDN security verification required</Message></Error>'
+      );
+      return;
+    }
+
     sendAsset();
   });
 
@@ -324,7 +356,10 @@ async function startServer() {
 
     const cacheKey = imgCheck.url.toString();
     const chapterKey = refererUrl ? refererUrl.toString() : imgCheck.url.origin;
-    if (!bypassCache) {
+    if (bypassCache) {
+      // Explicitly evict any potentially corrupted cached copy before fetching fresh data
+      chapterCacheManager.delete(cacheKey);
+    } else {
       const cached = chapterCacheManager.get(cacheKey);
       if (cached) {
         res.setHeader('Content-Type', cached.contentType);
@@ -344,6 +379,7 @@ async function startServer() {
     let lastStatus = 502;
     let lastDiagnostic = 'NETWORK_ERROR';
     let lastErrorMessage = 'Bild konnte nicht geladen werden.';
+    let lastReceivedContentType: string | null = null;
 
     for (const tierReferer of refererTiers) {
       const headers: Record<string, string> = {
@@ -397,12 +433,23 @@ async function startServer() {
 
         const contentType = upstream.headers.get('content-type');
         const buffer = await readResponseWithLimit(upstream, MAX_IMAGE_BYTES);
+        const verification = verifyReceivedImageBuffer(contentType, buffer.subarray(0, 256));
 
-        // Peek first 256 bytes + strict image/* check to block HTML-Challenge disguised as HTTP 200
-        if (!isValidImageContentType(contentType) || isHtmlPayload(buffer.subarray(0, 256))) {
+        // Block text/html & application/xml security/CDN challenges disguised as HTTP 200 before caching
+        if (
+          verification.isSecurityChallenge ||
+          !isValidImageContentType(contentType) ||
+          isHtmlPayload(buffer.subarray(0, 256))
+        ) {
           lastStatus = 403;
-          lastDiagnostic = 'HTML_CHALLENGE';
-          lastErrorMessage = 'HTTP 403: Server lieferte HTML-Sicherheitsabfrage statt Bilddaten.';
+          lastReceivedContentType = verification.detectedContentType;
+          lastDiagnostic = verification.detectedContentType.includes('xml')
+            ? 'XML_CHALLENGE'
+            : 'HTML_CHALLENGE';
+          lastErrorMessage = `HTTP 403: Sicherheits-/CDN-Abfrage (${verification.detectedContentType}) statt Bilddaten empfangen.`;
+          console.warn(
+            `[ImageProxy][Security/CDN Challenge] ${imgCheck.url.toString()} -> ${verification.detectedContentType}`
+          );
           continue; // Try next Referer tier
         }
 
@@ -433,10 +480,13 @@ async function startServer() {
       }
     }
 
+    if (lastReceivedContentType) {
+      res.setHeader('X-Manga-Received-Content-Type', lastReceivedContentType);
+    }
     res
       .status(lastStatus)
       .setHeader('X-Manga-Diagnostic', lastDiagnostic)
-      .json({ error: lastErrorMessage });
+      .json({ error: lastErrorMessage, receivedContentType: lastReceivedContentType });
   });
 
   // 3. Chapter HTML Image Extraction Endpoint
@@ -637,11 +687,71 @@ async function startServer() {
     }
   });
 
+  const httpServer = http.createServer(app);
+
   // Dev Vite middleware or production static files
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
+
+    if (hmrDisabled) {
+      // Vite 8 still injects /@vite/client in middlewareMode even when ws/hmr is false;
+      // serve a lightweight ESM shim with the 5 expected exports so CSS injection works
+      // without attempting any failing HMR WebSocket connection.
+      const NOOP_VITE_CLIENT = `
+export class ErrorOverlay extends HTMLElement {}
+const sheetsMap = new Map();
+export function updateStyle(id, content) {
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement('style');
+    style.setAttribute('type', 'text/css');
+    style.setAttribute('data-vite-dev-id', id);
+    document.head.appendChild(style);
+    sheetsMap.set(id, style);
+  }
+  style.textContent = content;
+}
+export function removeStyle(id) {
+  const style = sheetsMap.get(id);
+  if (style) {
+    style.remove();
+    sheetsMap.delete(id);
+  }
+}
+export function createHotContext() {
+  return {
+    data: {},
+    accept() {},
+    acceptExports() {},
+    dispose() {},
+    prune() {},
+    decline() {},
+    invalidate() {},
+    on() {},
+    off() {},
+    send() {},
+  };
+}
+export function injectQuery(url) {
+  return url;
+}
+`;
+      app.get('/@vite/client', (_req, res) => {
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(NOOP_VITE_CLIENT);
+      });
+    }
+
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        allowedHosts: true,
+        hmr: !hmrDisabled,
+        ws: hmrDisabled ? false : { server: httpServer },
+        watch: hmrDisabled ? null : {},
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -653,7 +763,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`MangaReaderApp Server aktiv auf http://0.0.0.0:${PORT}`);
   });
 }

@@ -208,3 +208,54 @@ test('formatBytesDe formats B, KB, MB, and GB cleanly in German notation', () =>
   assert.equal(formatBytesDe(32 * GB), '32,0 GB');
   assert.equal(formatBytesDe(1.5 * GB), '1,5 GB');
 });
+
+test('single-image cache invalidation removes only the corrupted entry on server and client', async () => {
+  const now = 1_800_000_000_000;
+  const serverCache = new ChapterCacheManager({ maxBytes: 1024 * 1024 });
+  serverCache.set({
+    key: 'https://cdn.test/corrupt.jpg',
+    chapterKey: 'https://manga.test/ch-1',
+    buffer: Buffer.alloc(100),
+    contentType: 'image/jpeg',
+    cachedAt: now,
+  });
+  serverCache.set({
+    key: 'https://cdn.test/healthy.jpg',
+    chapterKey: 'https://manga.test/ch-1',
+    buffer: Buffer.alloc(200),
+    contentType: 'image/jpeg',
+    cachedAt: now,
+  });
+
+  assert.equal(serverCache.delete('https://cdn.test/corrupt.jpg'), true);
+  assert.equal(serverCache.delete('https://cdn.test/corrupt.jpg'), false);
+  assert.equal(serverCache.get('https://cdn.test/corrupt.jpg', now), null);
+  assert.notEqual(serverCache.get('https://cdn.test/healthy.jpg', now), null);
+  assert.equal(serverCache.getStats().totalBytes, 200);
+
+  const { adapter, deletedUrls } = createInMemoryAdapter([
+    {
+      url: 'https://cdn.test/corrupt.jpg',
+      chapterUrl: 'https://manga.test/ch-1',
+      sizeBytes: 100,
+      contentType: 'image/jpeg',
+      cachedAt: now,
+      lastAccessedAt: now,
+    },
+    {
+      url: 'https://cdn.test/healthy.jpg',
+      chapterUrl: 'https://manga.test/ch-1',
+      sizeBytes: 200,
+      contentType: 'image/jpeg',
+      cachedAt: now,
+      lastAccessedAt: now,
+    },
+  ]);
+
+  const clientCache = new ClientCacheManager(adapter);
+  const removed = await clientCache.invalidateUrl('https://cdn.test/corrupt.jpg');
+  assert.equal(removed, true);
+  assert.deepEqual(deletedUrls, ['https://cdn.test/corrupt.jpg']);
+  assert.equal(clientCache.calculateStorageUsage().entryCount, 1);
+  assert.equal(clientCache.calculateStorageUsage().totalBytes, 200);
+});

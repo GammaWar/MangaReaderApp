@@ -2,6 +2,8 @@ package com.mangareader
 
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.util.Log
 import android.webkit.CookieManager
 import coil.ImageLoader
@@ -393,12 +395,12 @@ private class MangaHeaderAndChallengeInterceptor : Interceptor {
             val peekPrefix = runCatching { response.peekBody(256).string().trimStart().lowercase() }
                 .getOrDefault("")
 
-            val isHtmlChallenge =
-                contentType.contains("text/html") ||
-                    peekPrefix.startsWith("<!doctype html") ||
-                    peekPrefix.startsWith("<html")
+            val detectedChallengeType = BitmapDecodeGuard.detectSecurityChallengeContentType(
+                headerContentType = contentType,
+                bufferPrefix = peekPrefix,
+            )
 
-            if (response.isSuccessful && !isHtmlChallenge && contentType.startsWith("image/")) {
+            if (response.isSuccessful && detectedChallengeType == null && contentType.startsWith("image/")) {
                 return response
             }
 
@@ -406,15 +408,23 @@ private class MangaHeaderAndChallengeInterceptor : Interceptor {
                 return response
             }
 
-            if (isHtmlChallenge) {
+            if (detectedChallengeType != null) {
+                Log.w(
+                    "MangaReaderApp",
+                    "Security/CDN challenge detected for $imageUrlStr (Content-Type=$detectedChallengeType instead of image/*) — forcing Open in Browser ErrorView"
+                )
                 response.close()
                 lastResponse = Response.Builder()
                     .request(original)
                     .protocol(Protocol.HTTP_1_1)
                     .code(403)
-                    .message("HTML-Sicherheitsabfrage erkannt")
-                    .header("X-Manga-Diagnostic", "HTML_CHALLENGE")
-                    .body("HTTP 403: HTML-Sicherheitsabfrage".toResponseBody(null))
+                    .message("Sicherheits-/CDN-Prüfung erkannt ($detectedChallengeType)")
+                    .header(
+                        "X-Manga-Diagnostic",
+                        if (detectedChallengeType.contains("xml")) "XML_CHALLENGE" else "HTML_CHALLENGE"
+                    )
+                    .header("X-Manga-Received-Content-Type", detectedChallengeType)
+                    .body("HTTP 403: Security/CDN challenge ($detectedChallengeType)".toResponseBody(null))
                     .build()
                 continue
             }
@@ -471,7 +481,12 @@ private class SafeImageCacheInterceptor(
         val response = chain.proceed(chain.request())
         val contentType = response.header("Content-Type").orEmpty().lowercase()
 
-        if (!response.isSuccessful || !contentType.startsWith("image/") || contentType.contains("html")) {
+        if (
+            !response.isSuccessful ||
+            !contentType.startsWith("image/") ||
+            contentType.contains("html") ||
+            contentType.contains("xml")
+        ) {
             return response
         }
 
@@ -481,5 +496,90 @@ private class SafeImageCacheInterceptor(
             .removeHeader("Pragma")
             .header("Cache-Control", "public, max-age=2592000, immutable")
             .build()
+    }
+}
+
+/**
+ * Exception indicating that a `BitmapFactory` null-bitmap failure was caused by a
+ * `text/html` or `application/xml` security/CDN challenge — instructs the UI to
+ * immediately display `ImageErrorView` with the "Open in Browser" action.
+ */
+class CdnSecurityChallengeException(
+    val imageUrl: String,
+    val receivedContentType: String,
+    val openInBrowserRequired: Boolean = true,
+) : java.io.IOException(
+    "Security/CDN challenge detected ($receivedContentType instead of image/*) for $imageUrl"
+)
+
+/**
+ * Early null-bitmap guard for Android `BitmapFactory` stream decoding:
+ * If `BitmapFactory.decodeByteArray` returns `null`, automatically verifies the received buffer's
+ * Content-Type (header + leading payload bytes). When `text/html` or `application/xml` is detected,
+ * logs a Security/CDN challenge warning and throws [CdnSecurityChallengeException] so the reader
+ * immediately renders `ImageErrorView` with the "Open in Browser" action.
+ */
+object BitmapDecodeGuard {
+    private const val TAG = "BitmapDecodeGuard"
+
+    fun detectSecurityChallengeContentType(
+        headerContentType: String?,
+        bufferPrefix: String?,
+    ): String? {
+        val normalizedHeader = headerContentType.orEmpty().substringBefore(';').trim().lowercase()
+        val prefix = bufferPrefix.orEmpty().trimStart().lowercase()
+
+        if (normalizedHeader == "application/xml" || normalizedHeader == "text/xml" || normalizedHeader.contains("xml")) {
+            return if (normalizedHeader.isNotBlank()) normalizedHeader else "application/xml"
+        }
+        if (normalizedHeader == "text/html" || normalizedHeader == "application/xhtml+xml" || normalizedHeader.contains("html")) {
+            return if (normalizedHeader.isNotBlank()) normalizedHeader else "text/html"
+        }
+        if (prefix.startsWith("<?xml") || prefix.startsWith("<error>") || prefix.startsWith("<error ")) {
+            return "application/xml"
+        }
+        if (
+            prefix.startsWith("<!doctype html") ||
+            prefix.startsWith("<html") ||
+            prefix.contains("<title>just a moment") ||
+            prefix.contains("cf-browser-verification")
+        ) {
+            return "text/html"
+        }
+        return null
+    }
+
+    @Throws(CdnSecurityChallengeException::class)
+    fun decodeOrDiagnose(
+        imageUrl: String,
+        bytes: ByteArray,
+        headerContentType: String?,
+    ): Bitmap? {
+        val prefix = String(bytes, 0, minOf(bytes.size, 256), Charsets.UTF_8)
+        val preCheckChallenge = detectSecurityChallengeContentType(headerContentType, prefix)
+        if (preCheckChallenge != null) {
+            Log.w(
+                TAG,
+                "Security/CDN challenge detected prior to BitmapFactory decode: Content-Type=$preCheckChallenge url=$imageUrl"
+            )
+            throw CdnSecurityChallengeException(imageUrl, preCheckChallenge, openInBrowserRequired = true)
+        }
+
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        if (bitmap == null) {
+            val verifiedChallenge = detectSecurityChallengeContentType(headerContentType, prefix)
+            if (verifiedChallenge != null) {
+                Log.w(
+                    TAG,
+                    "BitmapFactory returned null bitmap due to Security/CDN challenge: Content-Type=$verifiedChallenge url=$imageUrl"
+                )
+                throw CdnSecurityChallengeException(imageUrl, verifiedChallenge, openInBrowserRequired = true)
+            }
+            Log.w(
+                TAG,
+                "BitmapFactory returned null bitmap for $imageUrl (Content-Type=${headerContentType ?: "unknown"}) — suggest per-image cache bypass"
+            )
+        }
+        return bitmap
     }
 }

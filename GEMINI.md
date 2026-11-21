@@ -46,9 +46,10 @@ Die Anwendung ist als Full-Stack-Web-App (React 19 + TypeScript + Tailwind CSS v
 - **Sichere Standard-Header**:
   - **Kein künstlicher `Origin`-Header** (vermeidet Ablehnungen strenger Bild-CDNs).
   - **`Accept: image/webp,image/png,image/jpeg,image/*;q=0.8`** (kein erzwungenes serverseitiges AVIF-Transcoding, verhindert Dekodierungsfehler).
-- **HTML-Challenge- & Null-Bitmap-Schutz**:
-  - Jede Antwort wird vor dem Weiterleiten bzw. Cachen geprüft: `Content-Type` muss mit `image/` beginnen UND ein Prefix-Check (`peekBody` auf erste 256 Bytes) stellt sicher, dass kein `<!doctype` oder `<html` enthalten ist.
-  - Liefert ein CDN trotz HTTP 200 eine Cloudflare-/Bot-HTML-Seite, gibt der Proxy gezielt **HTTP 403** mit `X-Manga-Diagnostic: HTML_CHALLENGE` zurück.
+- **HTML-/XML-Challenge- & Null-Bitmap-Schutz**:
+  - Jede Antwort wird vor dem Weiterleiten bzw. Cachen per `verifyReceivedImageBuffer()` geprüft: `Content-Type` muss mit `image/` beginnen UND ein Prefix-Check (`peekBody` auf erste 256 Bytes) stellt sicher, dass weder HTML (`<!doctype`, `<html`) noch XML (`<?xml`, `<Error`) enthalten ist.
+  - Liefert ein CDN trotz HTTP 200 eine `text/html`- oder `application/xml`-Antwort (z. B. Cloudflare-/S3-/WAF-Challenge), protokolliert die App dies als Sicherheits-/CDN-Challenge und gibt **HTTP 403** mit `X-Manga-Diagnostic: HTML_CHALLENGE | XML_CHALLENGE` sowie `X-Manga-Received-Content-Type` zurück.
+  - Clientseitig prüft `ReaderPageItem` per frühem `createImageBitmap(blob)`-Dekodierungscheck (sowie `BitmapDecodeGuard.decodeOrDiagnose` in `MangaReaderApplication.kt`) auf `'null bitmap'`-Fehler: schlägt die Dekodierung fehl, wird automatisch der `Content-Type` des empfangenen Puffers verifiziert und bei `text/html` oder `application/xml` sofort die `ImageErrorView` mit primärer Aktion **„Im Browser öffnen“** erzwungen.
 
 ### 3. Hintergrund-Pre-Fetching (`POST /api/prefetch`)
 - Lädt das HTML des erkannten Folgekapitels im Hintergrund vor, sobald der Leser die letzten 2 Seiten erreicht (`currentPage >= totalPages - 2`) und der Schalter **Automatisches Pre-Fetching** aktiv ist.
@@ -65,10 +66,10 @@ Die Anwendung ist als Full-Stack-Web-App (React 19 + TypeScript + Tailwind CSS v
 ### Gestaffelte Timeouts & Exponential Backoff
 - **Timeouts**: `15s` Verbindungsaufbau / Header, `20s` Gesamt-Lesezeit — verhindert endlose Ladekreise bei blockierten CDN-Nodes.
 - **Auto-Retry**: Bei **HTTP 429 (Rate-Limit)**, **HTTP 500–504** oder **Timeout** wiederholt der Client automatisch bis zu **3-mal** mit **400 ms → 800 ms → 1600 ms** Backoff und informiert per Snackbar.
-- **Kein sinnloser Retry**: **HTTP 404 (Datei existiert nicht)** und **HTTP 403 / HTML-Challenge** werden sofort ohne Endlosschleife als Diagnosekarte angezeigt.
+- **Kein sinnloser Retry**: **HTTP 404 (Datei existiert nicht)** und **HTTP 403 / HTML-/XML-Challenge** werden sofort ohne Endlosschleife als Diagnosekarte angezeigt.
 
 ### Aggressives, aber streng sicheres Caching & Konfigurierbarer Cache-Manager (Standard: 4 GB, manuelles Löschen)
-- Nur verifizierte `image/*`-Antworten (ohne HTML-Signatur) werden server- und clientseitig im Bild-Cache abgelegt.
+- Nur verifizierte `image/*`-Antworten (ohne HTML-/XML-Signatur) werden server- und clientseitig im Bild-Cache abgelegt.
 - Bei **„Erneut versuchen“** oder **„Sitzung erneuern“** wird `bypassCache=1` gesendet, um fehlerhaft oder veraltet gespeicherte Einträge sofort zu überschreiben.
 - **Konfigurierbarer `ChapterCacheManager` / `CacheManager`** (implementiert in `MangaReaderApplication.kt` für Android/Coil/OkHttp sowie in `src/utils/cacheManager.ts` + `server.ts` über `/api/cache/status` und `/api/cache/cleanup`):
   - **Keine automatische 31-Tage-Löschung**: Zwischengespeicherte Seiten bleiben dauerhaft erhalten, bis sie manuell gelöscht werden oder das konfigurierte Speicherlimit erreicht wird.
@@ -78,8 +79,9 @@ Die Anwendung ist als Full-Stack-Web-App (React 19 + TypeScript + Tailwind CSS v
 
 ### Transparente Diagnosekarte (`ImageErrorView`)
 Jede fehlgeschlagene Seite zeigt eine klar gekennzeichnete Karte mit Farb- **und** Text-/Icon-Kodierung:
+- **Dekodierungsfehler / Null Bitmap (`DECODE_ERROR`, Amber)**: Ungültige oder im Cache beschädigte Bilddaten (`image/*`) — bietet die explizite Primäraktion **„Cache-Bypass für dieses Bild“** (verwirft den einzelnen Eintrag im lokalen `ClientCacheManager` sowie serverseitig über `bypassCache=1` + `cb=<ts>` mit `cache: 'no-store'` und lädt die Datei frisch vom Server).
 - **HTTP 404 (Dunkelrot)**: Datei existiert nicht auf dem Server.
-- **HTTP 403 / HTML-Sicherheitsabfrage (Amber/Orange)**: Zugriff verweigert oder Bot-Prüfung — bietet **„Sitzung erneuern“** (1-Klick-Cache-Bypass + Neuabruf) und **„Browser“**.
+- **HTTP 403 / HTML- & XML-Sicherheitsabfrage (Amber/Orange)**: Zugriff verweigert oder Bot-/WAF-Prüfung (`text/html`, `application/xml`) — zeigt den empfangenen `Content-Type`, erzwingt sofort die Fehleransicht mit der prominenten Primäraktion **„Im Browser öffnen“** sowie **„Sitzung erneuern“** (1-Klick-Cache-Bypass + Neuabruf).
 - **HTTP 429 (Warmgelb)**: Temporäres Rate-Limit durch parallele Seitenabrufe.
 - **HTTP 500–504 / Timeout (Schiefer/Amber)**: Server vorübergehend nicht erreichbar.
 - **Aktionen auf jeder Karte**: *„Erneut versuchen“* und *„URL kopieren“* (kopiert die direkte Bild-URL in die Zwischenablage).

@@ -242,6 +242,12 @@ export class ChapterCacheManager {
     };
   }
 
+  delete(key: string): boolean {
+    if (!this.entries.has(key)) return false;
+    this.deleteEntry(key, 'size');
+    return true;
+  }
+
   getStats(overrideMaxBytes?: number): CacheManagerStats {
     const chapters = new Set<string>();
     for (const entry of this.entries.values()) {
@@ -628,12 +634,25 @@ export class ClientCacheManager {
     };
   }
 
-  private async removeUrl(url: string): Promise<void> {
-    const remaining = this.adapter.readIndex().filter((e) => e.url !== url);
-    this.adapter.writeIndex(remaining);
+  /**
+   * Invalidates a single corrupted or stale image URL from both metadata index and Blob Cache API.
+   * Used by the per-image "Cache-Bypass für dieses Bild" recovery action.
+   */
+  async invalidateUrl(url: string): Promise<boolean> {
+    if (!url) return false;
+    const existing = this.adapter.readIndex();
+    const existed = existing.some((e) => e.url === url);
+    if (existed) {
+      this.adapter.writeIndex(existing.filter((e) => e.url !== url));
+    }
     if (this.adapter.deleteBlob) {
       await this.adapter.deleteBlob(url);
     }
+    return existed;
+  }
+
+  private async removeUrl(url: string): Promise<void> {
+    await this.invalidateUrl(url);
   }
 }
 

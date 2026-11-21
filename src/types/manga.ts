@@ -17,11 +17,13 @@ export type DiagnosticKind =
 export interface ImageDiagnostic {
   kind: DiagnosticKind;
   httpStatus?: number;
+  receivedContentType?: string;
   title: string;
   description: string;
   hint: string;
   severity: 'crimson' | 'amber' | 'yellow' | 'slate';
   shouldAutoRetry: boolean;
+  suggestCacheBypass: boolean;
   suggestSessionRefresh: boolean;
   suggestOpenBrowser: boolean;
 }
@@ -31,7 +33,7 @@ export interface ChapterPage {
   url: string;
   displayUrl: string;
   fallbackAssetUrl?: string;
-  simError?: '404' | '403_html' | '429' | '503';
+  simError?: '404' | '403_html' | '429' | '503' | 'null_bitmap' | 'xml_challenge';
   label?: string;
 }
 

@@ -165,6 +165,22 @@ export const CATALOG_CHAPTERS: MangaChapter[] = [
         simError: '503',
         label: 'Seite 5 (HTTP 503 Server gestört)',
       },
+      {
+        index: 5,
+        url: '/api/demo-page?simError=null_bitmap&asset=manga1',
+        displayUrl: 'https://cdn.manhuatop.example.com/ch88/page-06-corrupt-cache.jpg',
+        fallbackAssetUrl: MANGA_PANEL_1,
+        simError: 'null_bitmap',
+        label: 'Seite 6 (Null-Bitmap / Defekter Cache)',
+      },
+      {
+        index: 6,
+        url: '/api/demo-page?simError=xml_challenge&asset=webtoon1',
+        displayUrl: 'https://cdn.manhuatop.example.com/ch88/page-07-cdn-xml-challenge.webp',
+        fallbackAssetUrl: WEBTOON_PANEL_1,
+        simError: 'xml_challenge',
+        label: 'Seite 7 (application/xml CDN-Challenge)',
+      },
     ],
   },
 ];
