@@ -1,3 +1,12 @@
 <resources>
     <string name="app_name">MangaReaderApp</string>
+    <string name="url_placeholder">URL eingeben oder einfügen (z.B. https://...)</string>
+    <string name="extract_button">Bilder extrahieren</string>
+    <string name="browser_tab">Browser</string>
+    <string name="reader_tab">Reader</string>
+    <string name="downloads_tab">Downloads</string>
+    <string name="next_chapter">Nächstes Kapitel</string>
+    <string name="prev_chapter">Vorheriges Kapitel</string>
+    <string name="download_chapter">Kapitel herunterladen</string>
+    <string name="switch_to_browser">Zum Browser</string>
 </resources>

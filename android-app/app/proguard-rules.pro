@@ -1,5 +1,5 @@
-# Keep OkHttp / Jsoup / Coil rules clean for R8 release APK builds
--dontwarn okhttp3.**
--dontwarn okio.**
--dontwarn org.jsoup.**
--keepattributes Signature,InnerClasses,EnclosingMethod
+# Add project specific ProGuard rules here.
+-keepattributes *Annotation*
+-keepclassmembers class * {
+    @android.webkit.JavascriptInterface <methods>;
+}
