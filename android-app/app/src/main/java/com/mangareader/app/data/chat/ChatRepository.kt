@@ -9,11 +9,39 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
+data class ChatInitialState(
+    val messages: List<ChatMessage>,
+    val persona: ChatPersonaId,
+    val model: ChatModelId,
+    val apiKey: String
+)
+
 class ChatRepository(private val context: Context) {
 
     private val chatFile = File(context.filesDir, "assistant_chat_history.json")
-    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val prefs by lazy { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
     private val writeMutex = Mutex()
+
+    suspend fun loadInitialState(): ChatInitialState = withContext(Dispatchers.IO) {
+        ChatInitialState(
+            messages = loadMessagesSync(),
+            persona = loadPersonaSync(),
+            model = loadModelSync(),
+            apiKey = loadApiKeySync()
+        )
+    }
+
+    suspend fun saveApiKey(apiKey: String) = withContext(Dispatchers.IO) {
+        saveApiKeySync(apiKey)
+    }
+
+    suspend fun savePersona(personaId: ChatPersonaId) = withContext(Dispatchers.IO) {
+        savePersonaSync(personaId)
+    }
+
+    suspend fun saveModel(modelId: ChatModelId) = withContext(Dispatchers.IO) {
+        saveModelSync(modelId)
+    }
 
     fun loadApiKeySync(): String = prefs.getString(KEY_GEMINI_API_KEY, "").orEmpty().trim()
 

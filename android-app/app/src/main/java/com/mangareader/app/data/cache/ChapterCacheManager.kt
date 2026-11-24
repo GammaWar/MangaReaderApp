@@ -3,7 +3,14 @@ package com.mangareader.app.data.cache
 import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -62,16 +69,52 @@ class ChapterCacheManager(
 
     private val pruneMutex = Mutex()
 
-    @Volatile
-    private var maxSizeBytes: Long = clampCacheLimitBytes(initialMaxSizeBytes)
+    private val _maxSizeBytesFlow = MutableStateFlow(clampCacheLimitBytes(initialMaxSizeBytes))
+    val maxSizeBytesFlow: StateFlow<Long> = _maxSizeBytesFlow.asStateFlow()
+
+    private val _statsFlow = MutableStateFlow(CacheStats(maxBytes = _maxSizeBytesFlow.value))
+    val statsFlow: StateFlow<CacheStats> = _statsFlow.asStateFlow()
 
     @Volatile
     private var lastPruneTimestampMs: Long = 0L
 
-    fun getMaxSizeBytes(): Long = maxSizeBytes
+    fun getMaxSizeBytes(): Long = _maxSizeBytesFlow.value
 
     fun updateMaxSizeBytes(newMaxBytes: Long) {
-        maxSizeBytes = clampCacheLimitBytes(newMaxBytes)
+        val clamped = clampCacheLimitBytes(newMaxBytes)
+        _maxSizeBytesFlow.value = clamped
+        val current = _statsFlow.value
+        val pct = if (clamped > 0L) {
+            ((current.totalBytes.toDouble() / clamped.toDouble()) * 100.0).coerceIn(0.0, 100.0).toFloat()
+        } else {
+            0f
+        }
+        _statsFlow.value = current.copy(maxBytes = clamped, usagePercent = pct)
+    }
+
+    /**
+     * Bindet das Cache-Limit reaktiv an einen DataStore-Flow (512 MB – 32 GB).
+     * Bei Limit-Änderungen wird der interne Grenzwert aktualisiert und bei Bedarf
+     * unmittelbar gegen die 90-%-Hysterese geprüft.
+     */
+    fun bindToLimitFlow(
+        scope: CoroutineScope,
+        limitBytesFlow: Flow<Long>,
+        pruneOnChange: Boolean = true,
+        onPruned: (suspend (CachePruneReport) -> Unit)? = null
+    ): Job = scope.launch(Dispatchers.IO) {
+        limitBytesFlow
+            .map { clampCacheLimitBytes(it) }
+            .distinctUntilChanged()
+            .collect { clampedLimit ->
+                updateMaxSizeBytes(clampedLimit)
+                if (pruneOnChange) {
+                    val report = pruneWithLimitBytes(limitBytes = clampedLimit, forceCheck = true)
+                    onPruned?.invoke(report)
+                } else {
+                    getStats()
+                }
+            }
     }
 
     /**
@@ -106,7 +149,7 @@ class ChapterCacheManager(
     suspend fun getStats(): CacheStats = withContext(Dispatchers.IO) {
         val files = collectManagedFiles()
         val total = files.sumOf { it.length() }
-        val limit = maxSizeBytes
+        val limit = _maxSizeBytesFlow.value
         val pct = if (limit > 0L) {
             ((total.toDouble() / limit.toDouble()) * 100.0).coerceIn(0.0, 100.0).toFloat()
         } else {
@@ -118,7 +161,7 @@ class ChapterCacheManager(
             maxBytes = limit,
             usagePercent = pct,
             lastPruneTimestampMs = lastPruneTimestampMs.takeIf { it > 0L }
-        )
+        ).also { _statsFlow.value = it }
     }
 
     /**
@@ -146,6 +189,12 @@ class ChapterCacheManager(
 
             managedDirectories.forEach { pruneEmptySubdirectories(it) }
             lastPruneTimestampMs = now
+            publishStatsSnapshot(
+                totalBytes = remainingBytes,
+                fileCount = remainingCount,
+                limitBytes = _maxSizeBytesFlow.value,
+                lastPruneMs = now
+            )
 
             CachePruneReport(
                 removedExpiredCount = 0,
@@ -159,7 +208,7 @@ class ChapterCacheManager(
     }
 
     suspend fun pruneIfNeeded(forceCheck: Boolean = false): CachePruneReport =
-        pruneWithLimitBytes(limitBytes = maxSizeBytes, forceCheck = forceCheck)
+        pruneWithLimitBytes(limitBytes = _maxSizeBytesFlow.value, forceCheck = forceCheck)
 
     internal suspend fun pruneWithLimitBytes(
         limitBytes: Long,
@@ -170,11 +219,18 @@ class ChapterCacheManager(
                 val now = System.currentTimeMillis()
                 if (!forceCheck && now - lastPruneTimestampMs < TimeUnit.MINUTES.toMillis(5)) {
                     val existing = collectManagedFiles()
+                    val existingBytes = existing.sumOf { it.length() }
+                    publishStatsSnapshot(
+                        totalBytes = existingBytes,
+                        fileCount = existing.size,
+                        limitBytes = _maxSizeBytesFlow.value,
+                        lastPruneMs = lastPruneTimestampMs.takeIf { it > 0L }
+                    )
                     return@withLock CachePruneReport(
                         removedExpiredCount = 0,
                         removedSizeEvictedCount = 0,
                         freedBytes = 0L,
-                        remainingBytes = existing.sumOf { it.length() },
+                        remainingBytes = existingBytes,
                         remainingFileCount = existing.size,
                         timestampMs = now
                     )
@@ -206,6 +262,12 @@ class ChapterCacheManager(
 
                 managedDirectories.forEach { pruneEmptySubdirectories(it) }
                 lastPruneTimestampMs = now
+                publishStatsSnapshot(
+                    totalBytes = currentTotalBytes,
+                    fileCount = survivingFiles.size,
+                    limitBytes = _maxSizeBytesFlow.value,
+                    lastPruneMs = now
+                )
 
                 CachePruneReport(
                     removedExpiredCount = 0,
@@ -217,6 +279,26 @@ class ChapterCacheManager(
                 )
             }
         }
+
+    private fun publishStatsSnapshot(
+        totalBytes: Long,
+        fileCount: Int,
+        limitBytes: Long,
+        lastPruneMs: Long?
+    ) {
+        val pct = if (limitBytes > 0L) {
+            ((totalBytes.toDouble() / limitBytes.toDouble()) * 100.0).coerceIn(0.0, 100.0).toFloat()
+        } else {
+            0f
+        }
+        _statsFlow.value = CacheStats(
+            totalBytes = totalBytes,
+            fileCount = fileCount,
+            maxBytes = limitBytes,
+            usagePercent = pct,
+            lastPruneTimestampMs = lastPruneMs
+        )
+    }
 
     private fun collectManagedFiles(): List<File> {
         val cacheRootCanonical = runCatching { cacheRootDir.canonicalFile }.getOrNull() ?: return emptyList()

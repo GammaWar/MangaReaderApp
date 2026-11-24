@@ -85,6 +85,7 @@ import com.mangareader.app.ui.theme.DisplayFontFamily
 import com.mangareader.app.ui.theme.ErrorColor
 import com.mangareader.app.ui.theme.HairlineBorder
 import com.mangareader.app.ui.theme.MonoFontFamily
+import com.mangareader.app.ui.theme.PureAmoledBlack
 import com.mangareader.app.ui.theme.TextPrimary
 import com.mangareader.app.ui.theme.TextSecondary
 import com.mangareader.app.ui.theme.TextTertiary
@@ -138,7 +139,7 @@ fun LibraryScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(DarkBackground)
+            .background(PureAmoledBlack)
     ) {
         LazyColumn(
             modifier = Modifier.fillMaxSize(),

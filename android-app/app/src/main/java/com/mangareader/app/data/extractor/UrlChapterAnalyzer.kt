@@ -34,7 +34,11 @@ object UrlChapterAnalyzer {
         Regex("""(?i)banner"""),
         Regex("""(?i)ads?[-_/]"""),
         Regex("""(?i)spinner"""),
-        Regex("""(?i)loading\.(gif|svg)"""),
+        Regex("""(?i)placeholder"""),
+        Regex("""(?i)spacer"""),
+        Regex("""(?i)1x1"""),
+        Regex("""(?i)blank\.(gif|png|jpg|webp)"""),
+        Regex("""(?i)loading\.(gif|svg|png)"""),
         Regex("""(?i)pixel\.(gif|png)"""),
         Regex("""(?i)\.svg(\?|$)"""),
         Regex("""(?i)gravatar\.com"""),
@@ -238,6 +242,20 @@ object UrlChapterAnalyzer {
                 }
             }
 
+            if (rawSrc == null) {
+                val srcsetAttrs = listOf("data-srcset", "srcset")
+                for (attr in srcsetAttrs) {
+                    val attrRegex = Regex("""(?i)\b${Regex.escape(attr)}\s*=\s*(?:"([^"]+)"|'([^']+)')""")
+                    val m = attrRegex.find(tag) ?: continue
+                    val rawSet = (m.groupValues[1].ifEmpty { m.groupValues[2] }).trim()
+                    val firstCandidate = rawSet.substringBefore(",").trim().substringBefore(" ").trim()
+                    if (isValidImageCandidate(firstCandidate)) {
+                        rawSrc = firstCandidate
+                        break
+                    }
+                }
+            }
+
             if (rawSrc == null) continue
             val resolved = resolve(rawSrc) ?: continue
             val lowerResolved = resolved.lowercase()
@@ -251,24 +269,48 @@ object UrlChapterAnalyzer {
     }
 
     /**
-     * Scans HTML for 'Next Chapter' navigation links.
+     * Scans HTML for 'Next Chapter' navigation links (rel="next", next-chapter classes, or link text).
      */
     fun extractNextChapterUrlFromHtml(html: String, baseUrl: String): String? {
-        val aTagRegex = Regex("""(?i)<a[^>]+href\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""")
-        val nextKeywords = listOf("next", "nächstes", "weiter", "suivant", "next chapter", "»", ">")
+        fun resolveSafeHref(href: String): String? {
+            val trimmed = href.trim()
+            if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.lowercase().startsWith("javascript:")) {
+                return null
+            }
+            val resolved = runCatching { URI(baseUrl).resolve(trimmed).toString() }.getOrNull() ?: return null
+            if (resolved == baseUrl) return null
+            val lower = resolved.lowercase()
+            return if (lower.startsWith("http://") || lower.startsWith("https://")) resolved else null
+        }
 
-        for (match in aTagRegex.findAll(html)) {
-            val href = match.groupValues[1]
-            val text = match.groupValues[2].replace(Regex("<[^>]+>"), "").trim().lowercase()
-            if (nextKeywords.any { text == it || text.contains(it) } && !href.startsWith("javascript:")) {
-                return try {
-                    URI(baseUrl).resolve(href).toString()
-                } catch (e: Exception) {
-                    href
+        val aTagFullRegex = Regex("""(?i)<a\b([^>]*)>([\s\S]*?)</a>""")
+        val hrefRegex = Regex("""(?i)\bhref\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""")
+        val relNextRegex = Regex("""(?i)\brel\s*=\s*(?:"[^"]*\bnext\b[^"]*"|'[^']*\bnext\b[^']*'|next\b)""")
+        val classNextRegex = Regex(
+            """(?i)\bclass\s*=\s*(?:"[^"]*\b(next-chapter|next_chapter|btn-next|ch-next|nav-next|navi-change-chapter-next)\b[^"]*"|'[^']*\b(next-chapter|next_chapter|btn-next|ch-next|nav-next|navi-change-chapter-next)\b[^']*')"""
+        )
+        val nextKeywords = listOf("next chapter", "nächstes kapitel", "next", "nächstes", "weiter", "suivant", "»")
+
+        var textMatchFallback: String? = null
+
+        for (match in aTagFullRegex.findAll(html)) {
+            val attrs = match.groupValues[1]
+            val hrefMatch = hrefRegex.find(attrs) ?: continue
+            val href = hrefMatch.groupValues[1].ifEmpty { hrefMatch.groupValues[2].ifEmpty { hrefMatch.groupValues[3] } }
+            val resolved = resolveSafeHref(href) ?: continue
+
+            if (relNextRegex.containsMatchIn(attrs) || classNextRegex.containsMatchIn(attrs)) {
+                return resolved
+            }
+
+            if (textMatchFallback == null) {
+                val text = match.groupValues[2].replace(Regex("<[^>]+>"), "").trim().lowercase()
+                if (nextKeywords.any { text == it || text.contains(it) }) {
+                    textMatchFallback = resolved
                 }
             }
         }
-        return null
+        return textMatchFallback
     }
 
     /**

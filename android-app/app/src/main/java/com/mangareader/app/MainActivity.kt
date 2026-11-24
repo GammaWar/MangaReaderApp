@@ -71,12 +71,12 @@ import com.mangareader.app.ui.theme.AccentPrimaryLight
 import com.mangareader.app.ui.theme.BodyFontFamily
 import com.mangareader.app.ui.theme.ButtonBorder
 import com.mangareader.app.ui.theme.CardBorder
-import com.mangareader.app.ui.theme.DarkBackground
 import com.mangareader.app.ui.theme.DarkSurface
 import com.mangareader.app.ui.theme.DarkSurfaceElevated
 import com.mangareader.app.ui.theme.DisplayFontFamily
 import com.mangareader.app.ui.theme.HairlineBorder
 import com.mangareader.app.ui.theme.MangaReaderAppTheme
+import com.mangareader.app.ui.theme.PureAmoledBlack
 import com.mangareader.app.ui.theme.TextMuted
 import com.mangareader.app.ui.theme.TextPrimary
 import com.mangareader.app.ui.viewmodel.MangaViewModel
@@ -144,9 +144,13 @@ fun MainScreen(viewModel: MangaViewModel) {
         }
     }
 
+    val isReadingActiveChapter = activeTab == AppTab.READER &&
+        currentChapter != null &&
+        currentChapter!!.images.isNotEmpty()
+
     Scaffold(
         modifier = Modifier.fillMaxSize(),
-        containerColor = DarkBackground,
+        containerColor = PureAmoledBlack,
         snackbarHost = {
             SnackbarHost(snackbarHostState) { data ->
                 Snackbar(
@@ -158,7 +162,7 @@ fun MainScreen(viewModel: MangaViewModel) {
             }
         },
         topBar = {
-            if (activeTab != AppTab.READER) {
+            if (!isReadingActiveChapter) {
                 AppShellTopBar(
                     onBrandClick = { viewModel.setActiveTab(AppTab.LIBRARY) },
                     onOpenSettings = { viewModel.setSettingsOpen(true) }
@@ -166,7 +170,7 @@ fun MainScreen(viewModel: MangaViewModel) {
             }
         },
         bottomBar = {
-            if (activeTab != AppTab.READER) {
+            if (!isReadingActiveChapter) {
                 AppShellBottomBar(
                     activeTab = activeTab,
                     hasLoadedChapter = currentChapter != null,
@@ -204,7 +208,13 @@ fun MainScreen(viewModel: MangaViewModel) {
             if (activeTab == AppTab.READER) {
                 ReaderScreen(
                     viewModel = viewModel,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = if (isReadingActiveChapter) {
+                        Modifier.fillMaxSize()
+                    } else {
+                        Modifier
+                            .fillMaxSize()
+                            .padding(innerPadding)
+                    }
                 )
             }
 
@@ -235,7 +245,7 @@ private fun AppShellTopBar(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(DarkBackground.copy(alpha = 0.96f))
+            .background(PureAmoledBlack.copy(alpha = 0.96f))
             .statusBarsPadding()
     ) {
         Row(
@@ -329,7 +339,7 @@ private fun AppShellBottomBar(
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(DarkBackground.copy(alpha = 0.96f))
+            .background(PureAmoledBlack.copy(alpha = 0.96f))
             .navigationBarsPadding()
     ) {
         HorizontalDivider(thickness = 1.dp, color = HairlineBorder)

@@ -20,7 +20,7 @@ private val DarkColorScheme = darkColorScheme(
     onSecondary = DarkBackground,
     tertiary = AccentTertiary,
     onTertiary = DarkBackground,
-    background = DarkBackground,
+    background = PureAmoledBlack,
     onBackground = TextPrimary,
     surface = DarkSurface,
     onSurface = TextPrimary,
@@ -43,9 +43,9 @@ fun MangaReaderAppTheme(
         SideEffect {
             val window = (view.context as? Activity)?.window
             @Suppress("DEPRECATION")
-            window?.statusBarColor = DarkBackground.toArgb()
+            window?.statusBarColor = PureAmoledBlack.toArgb()
             @Suppress("DEPRECATION")
-            window?.navigationBarColor = DarkBackground.toArgb()
+            window?.navigationBarColor = PureAmoledBlack.toArgb()
             window?.let {
                 val controller = WindowCompat.getInsetsController(it, view)
                 controller.isAppearanceLightStatusBars = false

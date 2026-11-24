@@ -1,7 +1,6 @@
 package com.mangareader.app.ui.viewmodel
 
 import android.app.Application
-import android.webkit.CookieManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import coil.Coil
@@ -17,8 +16,13 @@ import com.mangareader.app.data.chat.ChatPersonaId
 import com.mangareader.app.data.chat.ChatRepository
 import com.mangareader.app.data.chat.GeminiChatClient
 import com.mangareader.app.data.download.DownloadRepository
+import com.mangareader.app.data.extractor.ChapterLoadOutcome
+import com.mangareader.app.data.extractor.ChapterLoaderRepository
 import com.mangareader.app.data.extractor.UrlChapterAnalyzer
+import com.mangareader.app.data.extractor.WebViewFallbackReason
 import com.mangareader.app.data.library.LibraryRepository
+import com.mangareader.app.data.local.LegacyStorageMigrator
+import com.mangareader.app.data.local.MangaDatabase
 import com.mangareader.app.data.model.AppTab
 import com.mangareader.app.data.model.BookmarkItem
 import com.mangareader.app.data.model.Chapter
@@ -31,8 +35,10 @@ import com.mangareader.app.data.model.ReaderMode
 import com.mangareader.app.data.model.ReaderPreferences
 import com.mangareader.app.data.model.ReadingDirection
 import com.mangareader.app.data.model.WebTab
+import com.mangareader.app.data.network.MangaNetworkClients
 import com.mangareader.app.data.session.SessionManager
-import com.mangareader.app.util.AppConstants
+import com.mangareader.app.data.settings.SettingsDataStore
+import com.mangareader.app.ui.screens.reader.AutoScrollLogic
 import com.mangareader.app.util.UrlSafety
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -45,12 +51,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import java.io.ByteArrayOutputStream
-import java.util.concurrent.TimeUnit
 
 sealed class UiEvent {
     data class ShowSnackbar(val message: String) : UiEvent()
@@ -62,33 +62,35 @@ sealed class UiEvent {
 class MangaViewModel(application: Application) : AndroidViewModel(application) {
 
     private val mangaApp: MangaReaderApplication? = application as? MangaReaderApplication
-    private val downloadRepo = DownloadRepository(application)
-    private val sessionManager = SessionManager(application)
-    private val savedSession = sessionManager.loadSessionSync()
+    private val database: MangaDatabase = mangaApp?.database ?: MangaDatabase.getInstance(application)
+    private val settingsDataStore: SettingsDataStore = mangaApp?.settingsDataStore ?: SettingsDataStore(application)
 
-    // Browser Tabs Management
-    private val initialTab = WebTab(
-        title = "Startseite",
-        url = "https://mangadex.org"
+    private val chapterLoaderRepo = ChapterLoaderRepository(
+        chapterHttpClient = mangaApp?.chapterHttpClient ?: MangaNetworkClients.buildChapterHttpClient()
+    )
+    private val downloadRepo = DownloadRepository(application, database.downloadedChapterDao())
+    private val sessionManager = SessionManager(database.webTabDao(), settingsDataStore)
+    private val libraryRepo = LibraryRepository(
+        bookmarkDao = database.bookmarkDao(),
+        readingProgressDao = database.readingProgressDao(),
+        settingsDataStore = settingsDataStore
     )
 
-    private val _tabs = MutableStateFlow<List<WebTab>>(
-        savedSession?.tabs?.takeIf { it.isNotEmpty() } ?: listOf(initialTab)
-    )
+    // Browser Tabs Management (restored asynchronously from Room — zero Main-Thread disk I/O)
+    private var hasUserMutatedTabsBeforeRestore: Boolean = false
+    private var isSessionRestored: Boolean = false
+
+    private val _tabs = MutableStateFlow<List<WebTab>>(emptyList())
     val tabs: StateFlow<List<WebTab>> = _tabs.asStateFlow()
 
-    private val initialActiveTab = savedSession?.let { s ->
-        s.tabs.find { it.id == s.activeTabId } ?: s.tabs.firstOrNull()
-    } ?: initialTab
-
-    private val _activeWebTabId = MutableStateFlow(initialActiveTab.id)
+    private val _activeWebTabId = MutableStateFlow("")
     val activeWebTabId: StateFlow<String> = _activeWebTabId.asStateFlow()
 
     // Current URL of the active tab
-    private val _currentUrl = MutableStateFlow(initialActiveTab.url)
+    private val _currentUrl = MutableStateFlow(DEFAULT_START_URL)
     val currentUrl: StateFlow<String> = _currentUrl.asStateFlow()
 
-    private val _pageTitle = MutableStateFlow(initialActiveTab.title)
+    private val _pageTitle = MutableStateFlow(DEFAULT_START_TITLE)
     val pageTitle: StateFlow<String> = _pageTitle.asStateFlow()
 
     private val _isWebLoading = MutableStateFlow(false)
@@ -98,10 +100,10 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     val webProgress: StateFlow<Float> = _webProgress.asStateFlow()
 
     // Reader state (active chapter)
-    private val _currentChapter = MutableStateFlow<Chapter?>(initialActiveTab.chapter)
+    private val _currentChapter = MutableStateFlow<Chapter?>(null)
     val currentChapter: StateFlow<Chapter?> = _currentChapter.asStateFlow()
 
-    private val _readerMode = MutableStateFlow(savedSession?.readerMode ?: ReaderMode.VERTICAL_WEBTOON)
+    private val _readerMode = MutableStateFlow(ReaderMode.VERTICAL_WEBTOON)
     val readerMode: StateFlow<ReaderMode> = _readerMode.asStateFlow()
 
     private val _activeTab = MutableStateFlow(AppTab.LIBRARY)
@@ -118,12 +120,12 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // Explicit target page request (nonce to targetPage) for reliable jumps from Library/History/Offline
-    private val _targetPageRequest = MutableStateFlow(0 to initialActiveTab.lastReadPage.coerceAtLeast(0))
+    private val _targetPageRequest = MutableStateFlow(0 to 0)
     val targetPageRequest: StateFlow<Pair<Int, Int>> = _targetPageRequest.asStateFlow()
 
-    private var currentReaderPageIndex: Int = initialActiveTab.lastReadPage.coerceAtLeast(0)
+    private var currentReaderPageIndex: Int = 0
 
-    // Download state
+    // Download state (reaktiv aus Room)
     private val _downloadState = MutableStateFlow<DownloadState>(DownloadState.Idle)
     val downloadState: StateFlow<DownloadState> = _downloadState.asStateFlow()
 
@@ -133,34 +135,25 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     private val _isExtracting = MutableStateFlow(false)
     val isExtracting: StateFlow<Boolean> = _isExtracting.asStateFlow()
 
-    // Library (Bookmarks & History) and Reader Preferences
-    private val libraryRepo = LibraryRepository(application)
-    private val allLibraryItems = libraryRepo.loadItemsSync()
-    private val savedPrefs = libraryRepo.loadPreferencesSync()
-
-    private val _bookmarks = MutableStateFlow<List<BookmarkItem>>(allLibraryItems.filter { it.isBookmark })
+    // Library (Bookmarks & History) and Reader Preferences (reaktiv aus Room + DataStore)
+    private val _bookmarks = MutableStateFlow<List<BookmarkItem>>(emptyList())
     val bookmarks: StateFlow<List<BookmarkItem>> = _bookmarks.asStateFlow()
 
-    private val _history = MutableStateFlow<List<BookmarkItem>>(
-        allLibraryItems.filter { !it.isBookmark }.sortedByDescending { it.timestamp }
-    )
+    private val _history = MutableStateFlow<List<BookmarkItem>>(emptyList())
     val history: StateFlow<List<BookmarkItem>> = _history.asStateFlow()
 
-    private val _readerPreferences = MutableStateFlow<ReaderPreferences>(savedPrefs)
+    private val _readerPreferences = MutableStateFlow(ReaderPreferences())
     val readerPreferences: StateFlow<ReaderPreferences> = _readerPreferences.asStateFlow()
 
     private val _isAutoScrolling = MutableStateFlow(false)
     val isAutoScrolling: StateFlow<Boolean> = _isAutoScrolling.asStateFlow()
 
-    // Configurable Image Cache State (Default 4 GB, Range 512 MB - 32 GB)
-    private val initialLimitMb = mangaApp?.getConfiguredCacheLimitMb()
-        ?: ChapterCacheManager.DEFAULT_CACHE_LIMIT_MB
-
-    private val _cacheLimitMb = MutableStateFlow(initialLimitMb)
+    // Configurable Image Cache State (Default 4 GB, Range 512 MB - 32 GB, reaktiv aus DataStore)
+    private val _cacheLimitMb = MutableStateFlow(ChapterCacheManager.DEFAULT_CACHE_LIMIT_MB)
     val cacheLimitMb: StateFlow<Int> = _cacheLimitMb.asStateFlow()
 
     private val _cacheStats = MutableStateFlow(
-        CacheStats(maxBytes = ChapterCacheManager.mbToBytes(initialLimitMb))
+        CacheStats(maxBytes = ChapterCacheManager.DEFAULT_MAX_CACHE_SIZE_BYTES)
     )
     val cacheStats: StateFlow<CacheStats> = _cacheStats.asStateFlow()
 
@@ -171,6 +164,7 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingAutoExtractOnLoad: Boolean = false
     private var pendingTargetPage: Int? = null
     private var extractionTimeoutJob: Job? = null
+    private var nativeChapterLoadJob: Job? = null
 
     // Prefetch state & cache
     private var prefetchedChapter: Chapter? = null
@@ -178,32 +172,39 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     private val _prefetchState = MutableStateFlow(PrefetchState())
     val prefetchState: StateFlow<PrefetchState> = _prefetchState.asStateFlow()
 
-    // Assistant (Multi-turn Gemini Chat)
+    // Assistant (Multi-turn Gemini Chat — loaded asynchronously on Dispatchers.IO)
     private val chatRepo = ChatRepository(application)
     private val geminiClient = GeminiChatClient()
     private var chatStreamJob: Job? = null
 
-    private val _chatMessages = MutableStateFlow<List<ChatMessage>>(chatRepo.loadMessagesSync())
+    private val _chatMessages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val chatMessages: StateFlow<List<ChatMessage>> = _chatMessages.asStateFlow()
 
-    private val _selectedPersona = MutableStateFlow(chatRepo.loadPersonaSync())
+    private val _selectedPersona = MutableStateFlow(ChatPersonaId.MANGA_GUIDE)
     val selectedPersona: StateFlow<ChatPersonaId> = _selectedPersona.asStateFlow()
 
-    private val _selectedModel = MutableStateFlow(chatRepo.loadModelSync())
+    private val _selectedModel = MutableStateFlow(ChatModelId.STANDARD)
     val selectedModel: StateFlow<ChatModelId> = _selectedModel.asStateFlow()
 
     private val _isAssistantStreaming = MutableStateFlow(false)
     val isAssistantStreaming: StateFlow<Boolean> = _isAssistantStreaming.asStateFlow()
 
-    private val _apiKey = MutableStateFlow(chatRepo.loadApiKeySync())
+    private val _apiKey = MutableStateFlow("")
     val hasApiKey: StateFlow<Boolean>
         get() = _hasApiKey
-    private val _hasApiKey = MutableStateFlow(_apiKey.value.isNotBlank())
+    private val _hasApiKey = MutableStateFlow(false)
 
-    // Debounce save jobs to avoid excessive disk writes
+    // Debounce save jobs to avoid excessive disk/DB writes on rapid scrolling or slider drags
     private var saveSessionJob: Job? = null
-    private var persistLibraryJob: Job? = null
+    private var persistProgressJob: Job? = null
+    private var persistPreferencesJob: Job? = null
+    private var persistCacheLimitJob: Job? = null
     private var persistChatJob: Job? = null
+    private var pendingProgressChapter: Chapter? = null
+    private var pendingProgressDisplayTitle: String = ""
+    private var pendingProgressPage: Int = 0
+    private var hasPendingSessionWrite: Boolean = false
+    private var hasPendingChatWrite: Boolean = false
 
     // Session Refresh Trigger for retrying failed images after background token renewal
     private val _sessionRefreshTrigger = MutableStateFlow(0)
@@ -215,8 +216,135 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     val uiEvents: SharedFlow<UiEvent> = _uiEvents.asSharedFlow()
 
     init {
-        refreshDownloads()
-        refreshCacheStats()
+        observePersistenceFlows()
+        restoreInitialStateAsync()
+    }
+
+    private fun observePersistenceFlows() {
+        viewModelScope.launch {
+            libraryRepo.bookmarksFlow.collect { items ->
+                _bookmarks.value = items
+            }
+        }
+        viewModelScope.launch {
+            libraryRepo.historyFlow.collect { items ->
+                _history.value = items
+            }
+        }
+        viewModelScope.launch {
+            libraryRepo.readerPreferencesFlow.collect { prefs ->
+                if (persistPreferencesJob?.isActive != true) {
+                    _readerPreferences.value = prefs
+                }
+            }
+        }
+        viewModelScope.launch {
+            settingsDataStore.readerModeFlow.collect { mode ->
+                _readerMode.value = mode
+            }
+        }
+        viewModelScope.launch {
+            settingsDataStore.cacheLimitMbFlow.collect { limitMb ->
+                if (persistCacheLimitJob?.isActive != true) {
+                    _cacheLimitMb.value = limitMb
+                }
+            }
+        }
+        viewModelScope.launch {
+            downloadRepo.downloadedChaptersFlow.collect { chapters ->
+                _downloadedChapters.value = chapters
+            }
+        }
+        mangaApp?.let { app ->
+            viewModelScope.launch {
+                app.cacheManager.statsFlow.collect { stats ->
+                    _cacheStats.value = stats
+                }
+            }
+        }
+    }
+
+    private fun restoreInitialStateAsync() {
+        viewModelScope.launch(Dispatchers.IO) {
+            // 1. Ensure one-time migration from legacy JSON / SharedPreferences finishes first
+            runCatching {
+                mangaApp?.ensureLegacyMigrationCompleted()
+                    ?: LegacyStorageMigrator(
+                        context = getApplication(),
+                        database = database,
+                        settingsDataStore = settingsDataStore
+                    ).migrateIfNeeded()
+            }
+
+            // 2. Restore saved WebTabs, active tab, chapter & exact reading progress
+            val savedSession = runCatching { sessionManager.loadSession() }.getOrNull()
+            if (!hasUserMutatedTabsBeforeRestore) {
+                if (savedSession != null && savedSession.tabs.isNotEmpty()) {
+                    val activeTab = savedSession.tabs.find { it.id == savedSession.activeTabId }
+                        ?: savedSession.tabs.first()
+                    val exactSavedPage = activeTab.chapter?.let { ch ->
+                        val stored = libraryRepo.getReadingProgress(ch.chapterUrl)
+                        val candidate = stored?.lastReadPage ?: activeTab.lastReadPage
+                        candidate.coerceIn(0, (ch.images.size - 1).coerceAtLeast(0))
+                    } ?: activeTab.lastReadPage.coerceAtLeast(0)
+
+                    val syncedTabs = savedSession.tabs.map { tab ->
+                        if (tab.id == activeTab.id) tab.copy(lastReadPage = exactSavedPage) else tab
+                    }
+
+                    _tabs.value = syncedTabs
+                    _activeWebTabId.value = activeTab.id
+                    _currentUrl.value = activeTab.url
+                    _pageTitle.value = activeTab.title
+                    _currentChapter.value = activeTab.chapter
+                    _readerMode.value = savedSession.readerMode
+                    requestTargetPage(exactSavedPage)
+                } else {
+                    val defaultTab = createDefaultTab()
+                    _tabs.value = listOf(defaultTab)
+                    _activeWebTabId.value = defaultTab.id
+                    _currentUrl.value = defaultTab.url
+                    _pageTitle.value = defaultTab.title
+                    sessionManager.saveSession(listOf(defaultTab), defaultTab.id, _readerMode.value)
+                }
+            }
+            isSessionRestored = true
+
+            // 3. Reconcile disk offline downloads into Room & refresh live cache stats
+            runCatching { downloadRepo.syncWithDisk() }
+            mangaApp?.let { app ->
+                runCatching { _cacheStats.value = app.getCacheStats() }
+            }
+
+            // 4. Load assistant chat history & preferences off the Main-Thread
+            val chatInit = runCatching { chatRepo.loadInitialState() }.getOrNull()
+            if (chatInit != null) {
+                if (_chatMessages.value.isEmpty()) {
+                    _chatMessages.value = chatInit.messages
+                }
+                _selectedPersona.value = chatInit.persona
+                _selectedModel.value = chatInit.model
+                if (_apiKey.value.isBlank()) {
+                    _apiKey.value = chatInit.apiKey
+                    _hasApiKey.value = chatInit.apiKey.isNotBlank()
+                }
+            }
+        }
+    }
+
+    private fun createDefaultTab(url: String = DEFAULT_START_URL, title: String = DEFAULT_START_TITLE): WebTab =
+        WebTab(title = title, url = url)
+
+    private fun ensureActiveTabExists(initialUrl: String = DEFAULT_START_URL): String {
+        val current = _tabs.value
+        val activeId = _activeWebTabId.value
+        if (current.isNotEmpty() && current.any { it.id == activeId }) {
+            return activeId
+        }
+        val tab = createDefaultTab(url = initialUrl)
+        _tabs.value = listOf(tab)
+        _activeWebTabId.value = tab.id
+        return tab.id
     }
 
     private fun requestTargetPage(page: Int) {
@@ -226,14 +354,21 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun scheduleSaveSession() {
+        hasPendingSessionWrite = true
         saveSessionJob?.cancel()
         saveSessionJob = viewModelScope.launch {
-            delay(400)
-            sessionManager.saveSession(
-                tabs = _tabs.value,
-                activeTabId = _activeWebTabId.value,
-                readerMode = _readerMode.value
-            )
+            delay(350)
+            val tabsSnapshot = _tabs.value
+            val activeIdSnapshot = _activeWebTabId.value
+            val modeSnapshot = _readerMode.value
+            hasPendingSessionWrite = false
+            if (tabsSnapshot.isNotEmpty()) {
+                sessionManager.saveSession(
+                    tabs = tabsSnapshot,
+                    activeTabId = activeIdSnapshot,
+                    readerMode = modeSnapshot
+                )
+            }
         }
     }
 
@@ -244,24 +379,47 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateLastReadPage(pageIndex: Int) {
-        currentReaderPageIndex = pageIndex.coerceAtLeast(0)
+        val safePage = pageIndex.coerceAtLeast(0)
+        currentReaderPageIndex = safePage
         val ch = _currentChapter.value ?: return
+        val activeTab = _tabs.value.find { it.id == _activeWebTabId.value }
+        val displayTitle = if (!ch.isOffline && activeTab?.title?.isNotBlank() == true) activeTab.title else ch.title
+
         if (ch.isOffline) {
-            // Keep tab state untarnished when reading offline chapters
-            recordHistory(ch, pageIndex)
+            schedulePersistReadingProgress(ch, displayTitle, safePage)
             return
         }
 
         val currentTabId = _activeWebTabId.value
         val currentList = _tabs.value
-        val targetTab = currentList.find { it.id == currentTabId } ?: return
-        if (targetTab.lastReadPage == pageIndex) return
-
-        _tabs.value = currentList.map { tab ->
-            if (tab.id == currentTabId) tab.copy(lastReadPage = pageIndex) else tab
+        val targetTab = currentList.find { it.id == currentTabId }
+        if (targetTab != null && targetTab.lastReadPage != safePage) {
+            _tabs.value = currentList.map { tab ->
+                if (tab.id == currentTabId) tab.copy(lastReadPage = safePage) else tab
+            }
+            scheduleSaveSession()
         }
-        scheduleSaveSession()
-        recordHistory(ch, pageIndex)
+        schedulePersistReadingProgress(ch, displayTitle, safePage)
+    }
+
+    private fun schedulePersistReadingProgress(chapter: Chapter, displayTitle: String, page: Int) {
+        pendingProgressChapter = chapter
+        pendingProgressDisplayTitle = displayTitle
+        pendingProgressPage = page
+        persistProgressJob?.cancel()
+        persistProgressJob = viewModelScope.launch {
+            delay(350)
+            val ch = pendingProgressChapter ?: return@launch
+            val title = pendingProgressDisplayTitle
+            val savedPage = pendingProgressPage
+            pendingProgressChapter = null
+            libraryRepo.recordReadingProgress(
+                chapter = ch,
+                displayTitle = title,
+                page = savedPage,
+                trackHistory = _readerPreferences.value.isHistoryTrackingEnabled
+            )
+        }
     }
 
     // --- Cache Manager Controls ---
@@ -270,27 +428,33 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         val app = mangaApp ?: return
         viewModelScope.launch {
             _cacheStats.value = app.getCacheStats()
-            _cacheLimitMb.value = app.getConfiguredCacheLimitMb()
+            _cacheLimitMb.value = ChapterCacheManager.bytesToMb(settingsDataStore.getCacheLimitBytes())
         }
     }
 
     fun updateCacheLimitMb(limitMb: Int) {
         val clampedMb = ChapterCacheManager.clampCacheLimitMb(limitMb)
         _cacheLimitMb.value = clampedMb
-        val app = mangaApp ?: return
         val newLimitBytes = ChapterCacheManager.mbToBytes(clampedMb)
 
-        viewModelScope.launch {
-            val report = app.updateCacheLimitBytes(newLimitBytes)
-            _cacheStats.value = app.getCacheStats()
-            if (report.removedSizeEvictedCount > 0) {
-                val entryLabel = if (report.removedSizeEvictedCount == 1) "ältester Eintrag" else "älteste Einträge"
-                _uiEvents.emit(
-                    UiEvent.ShowSnackbar(
-                        "Cache-Limit (${ChapterCacheManager.formatCacheLimitLabel(clampedMb)}) angewendet: " +
-                            "${report.removedSizeEvictedCount} $entryLabel entfernt (${ChapterCacheManager.formatBytesDe(report.freedBytes)} frei)."
+        persistCacheLimitJob?.cancel()
+        persistCacheLimitJob = viewModelScope.launch {
+            delay(200)
+            val app = mangaApp
+            if (app != null) {
+                val report = app.updateCacheLimitBytes(newLimitBytes)
+                _cacheStats.value = app.getCacheStats()
+                if (report.removedSizeEvictedCount > 0) {
+                    val entryLabel = if (report.removedSizeEvictedCount == 1) "ältester Eintrag" else "älteste Einträge"
+                    _uiEvents.emit(
+                        UiEvent.ShowSnackbar(
+                            "Cache-Limit (${ChapterCacheManager.formatCacheLimitLabel(clampedMb)}) angewendet: " +
+                                "${report.removedSizeEvictedCount} $entryLabel entfernt (${ChapterCacheManager.formatBytesDe(report.freedBytes)} frei)."
+                        )
                     )
-                )
+                }
+            } else {
+                settingsDataStore.updateCacheLimitBytes(newLimitBytes)
             }
         }
     }
@@ -365,7 +529,8 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
 
     // --- Tab Management ---
 
-    fun addNewTab(url: String = "https://mangadex.org") {
+    fun addNewTab(url: String = DEFAULT_START_URL) {
+        hasUserMutatedTabsBeforeRestore = true
         val newTab = WebTab(
             title = "Neuer Tab",
             url = url
@@ -431,9 +596,11 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val safeUrl = validation.normalizedUrl ?: formatted
+        hasUserMutatedTabsBeforeRestore = true
+        val activeId = ensureActiveTabExists(safeUrl)
         _currentUrl.value = safeUrl
         _tabs.value = _tabs.value.map { tab ->
-            if (tab.id == _activeWebTabId.value) tab.copy(url = safeUrl) else tab
+            if (tab.id == activeId) tab.copy(url = safeUrl) else tab
         }
         scheduleSaveSession()
         viewModelScope.launch {
@@ -464,27 +631,24 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val safeUrl = validation.normalizedUrl ?: formatted
-        pendingTargetPage = 0
-        pendingAutoExtractOnLoad = true
-        _currentUrl.value = safeUrl
-        _tabs.value = _tabs.value.map { tab ->
-            if (tab.id == _activeWebTabId.value) tab.copy(url = safeUrl, lastReadPage = 0) else tab
-        }
-        scheduleSaveSession()
-        _activeTab.value = AppTab.BROWSER
-        viewModelScope.launch {
-            _uiEvents.emit(UiEvent.NavigateWebView(safeUrl))
-            _uiEvents.emit(UiEvent.ShowSnackbar("Lade Kapitel..."))
-        }
+        loadChapterNativeWithWebViewFallback(
+            url = safeUrl,
+            refererUrl = null,
+            prevChapterUrl = null,
+            targetPage = null,
+            openBrowserOnFallback = true,
+            loadingMessage = "Lade Kapitel nativ..."
+        )
     }
 
     fun openCurrentChapterInBrowser() {
         _isAutoScrolling.value = false
         val ch = _currentChapter.value
         if (ch != null && !ch.isOffline && UrlSafety.validateExternalUrl(ch.chapterUrl).valid) {
+            val activeId = ensureActiveTabExists(ch.chapterUrl)
             _currentUrl.value = ch.chapterUrl
             _tabs.value = _tabs.value.map { tab ->
-                if (tab.id == _activeWebTabId.value) tab.copy(url = ch.chapterUrl) else tab
+                if (tab.id == activeId) tab.copy(url = ch.chapterUrl) else tab
             }
             scheduleSaveSession()
             viewModelScope.launch {
@@ -497,8 +661,11 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     fun onWebPageStarted(url: String) {
         _currentUrl.value = url
         _isWebLoading.value = true
-        _tabs.value = _tabs.value.map { tab ->
-            if (tab.id == _activeWebTabId.value) tab.copy(url = url) else tab
+        val activeId = _activeWebTabId.value
+        if (activeId.isNotBlank()) {
+            _tabs.value = _tabs.value.map { tab ->
+                if (tab.id == activeId) tab.copy(url = url) else tab
+            }
         }
     }
 
@@ -532,10 +699,13 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         _pageTitle.value = cleanTitle
         _isWebLoading.value = false
 
-        _tabs.value = _tabs.value.map { tab ->
-            if (tab.id == _activeWebTabId.value) tab.copy(url = url, title = cleanTitle) else tab
+        val activeId = _activeWebTabId.value
+        if (activeId.isNotBlank()) {
+            _tabs.value = _tabs.value.map { tab ->
+                if (tab.id == activeId) tab.copy(url = url, title = cleanTitle) else tab
+            }
+            scheduleSaveSession()
         }
-        scheduleSaveSession()
 
         if (pendingSessionRefresh) {
             pendingSessionRefresh = false
@@ -602,12 +772,24 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
             isOffline = false
         )
 
-        val targetPage = (pendingTargetPage ?: 0).coerceIn(0, (chapter.images.size - 1).coerceAtLeast(0))
+        val explicitTarget = pendingTargetPage
         pendingTargetPage = null
+        viewModelScope.launch {
+            val resolvedPage = explicitTarget ?: libraryRepo.getReadingProgress(sourceUrl)?.lastReadPage ?: 0
+            applyLoadedChapter(chapter, resolvedPage)
+        }
+    }
 
+    private fun applyLoadedChapter(chapter: Chapter, targetPage: Int) {
+        val safePage = targetPage.coerceIn(0, (chapter.images.size - 1).coerceAtLeast(0))
+        hasUserMutatedTabsBeforeRestore = true
+        val activeId = ensureActiveTabExists(chapter.chapterUrl)
+
+        _currentUrl.value = chapter.chapterUrl
+        _pageTitle.value = chapter.title
         _tabs.value = _tabs.value.map { tab ->
-            if (tab.id == _activeWebTabId.value) {
-                tab.copy(chapter = chapter, url = sourceUrl, title = chapter.title, lastReadPage = targetPage)
+            if (tab.id == activeId) {
+                tab.copy(chapter = chapter, url = chapter.chapterUrl, title = chapter.title, lastReadPage = safePage)
             } else {
                 tab
             }
@@ -617,12 +799,86 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         prefetchedChapter = null
         _prefetchState.value = PrefetchState(forChapterUrl = chapter.nextChapterUrl.orEmpty())
         _currentChapter.value = chapter
-        requestTargetPage(targetPage)
-        recordHistory(chapter, targetPage)
+        requestTargetPage(safePage)
+        recordHistory(chapter, safePage)
         _activeTab.value = AppTab.READER
 
         viewModelScope.launch {
-            _uiEvents.emit(UiEvent.ShowSnackbar("${result.images.size} Seiten geladen!"))
+            _uiEvents.emit(UiEvent.ShowSnackbar("${chapter.images.size} Seiten geladen!"))
+        }
+    }
+
+    private fun loadChapterNativeWithWebViewFallback(
+        url: String,
+        refererUrl: String?,
+        prevChapterUrl: String?,
+        targetPage: Int?,
+        openBrowserOnFallback: Boolean,
+        loadingMessage: String
+    ) {
+        nativeChapterLoadJob?.cancel()
+        hasUserMutatedTabsBeforeRestore = true
+        val activeId = ensureActiveTabExists(url)
+        _isExtracting.value = true
+        _currentUrl.value = url
+        _tabs.value = _tabs.value.map { tab ->
+            if (tab.id == activeId) tab.copy(url = url, lastReadPage = (targetPage ?: 0).coerceAtLeast(0)) else tab
+        }
+        scheduleSaveSession()
+
+        nativeChapterLoadJob = viewModelScope.launch {
+            _uiEvents.emit(UiEvent.ShowSnackbar(loadingMessage))
+            try {
+                when (
+                    val outcome = chapterLoaderRepo.loadChapter(
+                        chapterUrl = url,
+                        refererUrl = refererUrl,
+                        prevChapterUrl = prevChapterUrl
+                    )
+                ) {
+                    is ChapterLoadOutcome.Success -> {
+                        _isExtracting.value = false
+                        val resolvedPage = targetPage
+                            ?: libraryRepo.getReadingProgress(outcome.chapter.chapterUrl)?.lastReadPage
+                            ?: 0
+                        applyLoadedChapter(outcome.chapter, resolvedPage)
+                    }
+                    is ChapterLoadOutcome.FallbackToWebView -> {
+                        _isExtracting.value = false
+                        val isChallenge = outcome.reason == WebViewFallbackReason.SECURITY_CHALLENGE
+                        pendingTargetPage = targetPage
+                        pendingAutoExtractOnLoad = !isChallenge
+                        _currentUrl.value = outcome.url
+                        _tabs.value = _tabs.value.map { tab ->
+                            if (tab.id == activeId) {
+                                tab.copy(url = outcome.url, lastReadPage = (targetPage ?: 0).coerceAtLeast(0))
+                            } else {
+                                tab
+                            }
+                        }
+                        scheduleSaveSession()
+                        if (openBrowserOnFallback || isChallenge) {
+                            _activeTab.value = AppTab.BROWSER
+                        }
+                        _uiEvents.emit(UiEvent.NavigateWebView(outcome.url))
+                        _uiEvents.emit(UiEvent.ShowSnackbar(outcome.message))
+                    }
+                    is ChapterLoadOutcome.BlockedOrInvalid -> {
+                        _isExtracting.value = false
+                        _uiEvents.emit(UiEvent.ShowSnackbar(outcome.reason))
+                    }
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                _isExtracting.value = false
+                pendingTargetPage = targetPage
+                pendingAutoExtractOnLoad = true
+                if (openBrowserOnFallback) {
+                    _activeTab.value = AppTab.BROWSER
+                }
+                _uiEvents.emit(UiEvent.NavigateWebView(url))
+            }
         }
     }
 
@@ -636,14 +892,7 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
             if (cachedPrefetch != null && cachedPrefetch.chapterUrl == nextUrl) {
                 prefetchedChapter = null
                 _prefetchState.value = PrefetchState()
-                onImagesExtracted(
-                    ExtractionResult(cachedPrefetch.title, cachedPrefetch.images, cachedPrefetch.nextChapterUrl),
-                    nextUrl
-                )
-                _currentUrl.value = nextUrl
-                viewModelScope.launch {
-                    _uiEvents.emit(UiEvent.NavigateWebView(nextUrl))
-                }
+                applyLoadedChapter(cachedPrefetch, targetPage = 0)
                 return
             }
 
@@ -654,15 +903,14 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
                 return
             }
 
-            viewModelScope.launch {
-                _uiEvents.emit(UiEvent.ShowSnackbar("Lade nächstes Kapitel nahtlos..."))
-                pendingAutoExtractOnLoad = true
-                _currentUrl.value = nextUrl
-                _tabs.value = _tabs.value.map { tab ->
-                    if (tab.id == _activeWebTabId.value) tab.copy(url = nextUrl) else tab
-                }
-                _uiEvents.emit(UiEvent.NavigateWebView(nextUrl))
-            }
+            loadChapterNativeWithWebViewFallback(
+                url = nextUrl,
+                refererUrl = chapter?.chapterUrl,
+                prevChapterUrl = chapter?.chapterUrl,
+                targetPage = 0,
+                openBrowserOnFallback = false,
+                loadingMessage = "Lade nächstes Kapitel nahtlos..."
+            )
         } else {
             viewModelScope.launch {
                 _uiEvents.emit(UiEvent.ShowSnackbar("Kein Folgelink gefunden. Öffne Seite im Browser."))
@@ -677,15 +925,14 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
             ?: UrlChapterAnalyzer.predictPrevChapterUrl(chapter?.chapterUrl ?: _currentUrl.value)
 
         if (!prevUrl.isNullOrBlank() && UrlSafety.validateExternalUrl(prevUrl).valid) {
-            viewModelScope.launch {
-                _uiEvents.emit(UiEvent.ShowSnackbar("Lade vorheriges Kapitel..."))
-                pendingAutoExtractOnLoad = true
-                _currentUrl.value = prevUrl
-                _tabs.value = _tabs.value.map { tab ->
-                    if (tab.id == _activeWebTabId.value) tab.copy(url = prevUrl) else tab
-                }
-                _uiEvents.emit(UiEvent.NavigateWebView(prevUrl))
-            }
+            loadChapterNativeWithWebViewFallback(
+                url = prevUrl,
+                refererUrl = chapter?.chapterUrl,
+                prevChapterUrl = null,
+                targetPage = 0,
+                openBrowserOnFallback = false,
+                loadingMessage = "Lade vorheriges Kapitel..."
+            )
         } else {
             viewModelScope.launch {
                 _uiEvents.emit(UiEvent.ShowSnackbar("Kein vorheriges Kapitel ermittelbar."))
@@ -726,7 +973,7 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshDownloads() {
         viewModelScope.launch {
-            _downloadedChapters.value = downloadRepo.getDownloadedChapters()
+            downloadRepo.syncWithDisk()
         }
     }
 
@@ -741,15 +988,20 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         )
         _isAutoScrolling.value = false
         _currentChapter.value = chapter
-        requestTargetPage(0)
-        recordHistory(chapter, 0)
         _activeTab.value = AppTab.READER
+
+        viewModelScope.launch {
+            val lookupKey = downloaded.sourceUrl.ifBlank { downloaded.title }
+            val savedPage = libraryRepo.getReadingProgress(lookupKey)?.lastReadPage ?: 0
+            val clampedPage = savedPage.coerceIn(0, (chapter.images.size - 1).coerceAtLeast(0))
+            requestTargetPage(clampedPage)
+            recordHistory(chapter, clampedPage)
+        }
     }
 
     fun deleteDownloadedChapter(chapterId: String) {
         viewModelScope.launch {
             downloadRepo.deleteChapter(chapterId)
-            refreshDownloads()
             _uiEvents.emit(UiEvent.ShowSnackbar("Offline-Kapitel gelöscht."))
         }
     }
@@ -770,7 +1022,9 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         if (mode != ReaderMode.VERTICAL_WEBTOON) {
             _isAutoScrolling.value = false
         }
-        scheduleSaveSession()
+        viewModelScope.launch {
+            settingsDataStore.updateReaderMode(mode)
+        }
     }
 
     fun setActiveTab(tab: AppTab) {
@@ -784,32 +1038,27 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         _activeTab.value = tab
     }
 
-    // --- Library & Bookmarks Management ---
+    // --- Library & Bookmarks Management (Room-backed) ---
 
     fun toggleCurrentChapterBookmark() {
         val chapter = _currentChapter.value ?: return
-        val existing = _bookmarks.value.find { it.chapterUrl == chapter.chapterUrl }
         val activeTab = _tabs.value.find { it.id == _activeWebTabId.value }
-        val updatedBookmarks = if (existing != null) {
-            _bookmarks.value.filter { it.id != existing.id }
+        val displayTitle = if (!chapter.isOffline && activeTab?.title?.isNotBlank() == true) {
+            activeTab.title
         } else {
-            val newItem = BookmarkItem(
-                title = if (!chapter.isOffline && activeTab?.title?.isNotBlank() == true) activeTab.title else chapter.title,
-                chapterTitle = chapter.title,
-                chapterUrl = chapter.chapterUrl,
-                coverImageUrl = chapter.images.firstOrNull(),
-                lastReadPage = currentReaderPageIndex,
-                totalPages = chapter.images.size,
-                isBookmark = true
-            )
-            listOf(newItem) + _bookmarks.value
+            chapter.title
         }
-        _bookmarks.value = updatedBookmarks
-        persistLibraryItems()
+        val currentPage = currentReaderPageIndex
+
         viewModelScope.launch {
+            val added = libraryRepo.toggleBookmark(
+                chapter = chapter,
+                displayTitle = displayTitle,
+                currentPage = currentPage
+            )
             _uiEvents.emit(
                 UiEvent.ShowSnackbar(
-                    if (existing != null) "Lesezeichen entfernt." else "Zu Lesezeichen hinzugefügt! ⭐"
+                    if (added) "Zu Lesezeichen hinzugefügt! ⭐" else "Lesezeichen entfernt."
                 )
             )
         }
@@ -817,56 +1066,32 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun recordHistory(chapter: Chapter, page: Int) {
         val activeTab = _tabs.value.find { it.id == _activeWebTabId.value }
-        var changed = false
+        val displayTitle = if (!chapter.isOffline && activeTab?.title?.isNotBlank() == true) {
+            activeTab.title
+        } else {
+            chapter.title
+        }
+        val trackHistory = _readerPreferences.value.isHistoryTrackingEnabled
 
-        if (_readerPreferences.value.isHistoryTrackingEnabled) {
-            val currentHistory = _history.value.toMutableList()
-            currentHistory.removeAll { it.chapterUrl == chapter.chapterUrl }
-            val newItem = BookmarkItem(
-                title = if (!chapter.isOffline && activeTab?.title?.isNotBlank() == true) activeTab.title else chapter.title,
-                chapterTitle = chapter.title,
-                chapterUrl = chapter.chapterUrl,
-                coverImageUrl = chapter.images.firstOrNull(),
-                lastReadPage = page,
-                totalPages = chapter.images.size,
-                isBookmark = false
+        viewModelScope.launch {
+            libraryRepo.recordReadingProgress(
+                chapter = chapter,
+                displayTitle = displayTitle,
+                page = page,
+                trackHistory = trackHistory
             )
-            currentHistory.add(0, newItem)
-            _history.value = currentHistory.take(60)
-            changed = true
-        }
-
-        // Always keep matching bookmark's lastReadPage synchronized
-        if (_bookmarks.value.any { it.chapterUrl == chapter.chapterUrl }) {
-            _bookmarks.value = _bookmarks.value.map { bm ->
-                if (bm.chapterUrl == chapter.chapterUrl) bm.copy(lastReadPage = page, timestamp = System.currentTimeMillis()) else bm
-            }
-            changed = true
-        }
-
-        if (changed) {
-            persistLibraryItems()
-        }
-    }
-
-    private fun persistLibraryItems() {
-        persistLibraryJob?.cancel()
-        persistLibraryJob = viewModelScope.launch {
-            delay(400)
-            libraryRepo.saveItems(_bookmarks.value + _history.value)
         }
     }
 
     fun deleteLibraryItem(id: String) {
-        _bookmarks.value = _bookmarks.value.filter { it.id != id }
-        _history.value = _history.value.filter { it.id != id }
-        persistLibraryItems()
+        viewModelScope.launch {
+            libraryRepo.deleteItem(id)
+        }
     }
 
     fun clearHistory() {
-        _history.value = emptyList()
-        persistLibraryItems()
         viewModelScope.launch {
+            libraryRepo.clearHistory()
             _uiEvents.emit(UiEvent.ShowSnackbar("Verlauf geleert."))
         }
     }
@@ -874,12 +1099,12 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     fun openLibraryItem(item: BookmarkItem) {
         val currentCh = _currentChapter.value
         if (currentCh != null && currentCh.chapterUrl == item.chapterUrl) {
-            _tabs.value = _tabs.value.map { tab ->
-                if (tab.id == _activeWebTabId.value) {
-                    tab.copy(lastReadPage = item.lastReadPage)
-                } else {
-                    tab
+            val activeId = _activeWebTabId.value
+            if (activeId.isNotBlank()) {
+                _tabs.value = _tabs.value.map { tab ->
+                    if (tab.id == activeId) tab.copy(lastReadPage = item.lastReadPage) else tab
                 }
+                scheduleSaveSession()
             }
             requestTargetPage(item.lastReadPage)
             _activeTab.value = AppTab.READER
@@ -893,29 +1118,23 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        pendingTargetPage = item.lastReadPage
-        pendingAutoExtractOnLoad = true
-        _currentUrl.value = item.chapterUrl
-        _tabs.value = _tabs.value.map { tab ->
-            if (tab.id == _activeWebTabId.value) {
-                tab.copy(url = item.chapterUrl, title = item.title, lastReadPage = item.lastReadPage)
-            } else {
-                tab
-            }
-        }
-        scheduleSaveSession()
-        _activeTab.value = AppTab.BROWSER
-        viewModelScope.launch {
-            _uiEvents.emit(UiEvent.NavigateWebView(item.chapterUrl))
-            _uiEvents.emit(UiEvent.ShowSnackbar("Lade '${item.chapterTitle}'..."))
-        }
+        loadChapterNativeWithWebViewFallback(
+            url = item.chapterUrl,
+            refererUrl = null,
+            prevChapterUrl = null,
+            targetPage = item.lastReadPage,
+            openBrowserOnFallback = true,
+            loadingMessage = "Lade '${item.chapterTitle}'..."
+        )
     }
 
-    // --- Reader Preferences, Autoscroll & Display Settings ---
+    // --- Reader Preferences, Autoscroll & Display Settings (DataStore-backed) ---
 
     fun updateReaderPreferences(prefs: ReaderPreferences) {
         _readerPreferences.value = prefs
-        viewModelScope.launch {
+        persistPreferencesJob?.cancel()
+        persistPreferencesJob = viewModelScope.launch {
+            delay(150)
             libraryRepo.savePreferences(prefs)
         }
     }
@@ -941,7 +1160,7 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setAutoScrollSpeed(speed: Float) {
-        updateReaderPreferences(_readerPreferences.value.copy(autoScrollSpeed = speed))
+        updateReaderPreferences(_readerPreferences.value.copy(autoScrollSpeed = AutoScrollLogic.clampSpeed(speed)))
     }
 
     fun setCustomBrightness(enabled: Boolean, level: Float = _readerPreferences.value.brightnessLevel) {
@@ -985,79 +1204,45 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
 
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val cookie = runCatching {
-                    CookieManager.getInstance().getCookie(nextUrl)
-                }.getOrNull()
-
-                val client = mangaApp?.okHttpClient ?: OkHttpClient.Builder()
-                    .connectTimeout(15, TimeUnit.SECONDS)
-                    .readTimeout(20, TimeUnit.SECONDS)
-                    .build()
-
-                val request = Request.Builder()
-                    .url(nextUrl)
-                    .header("User-Agent", AppConstants.USER_AGENT)
-                    .header("Referer", chapter.chapterUrl)
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                    .apply {
-                        if (!cookie.isNullOrBlank()) header("Cookie", cookie)
-                    }
-                    .build()
-
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        _prefetchState.value = PrefetchState(forChapterUrl = nextUrl, status = PrefetchStatus.UNAVAILABLE)
-                        return@use
-                    }
-
-                    val body = response.body ?: return@use
-                    val html = readLimitedString(body.byteStream(), maxBytes = 4 * 1024 * 1024)
-                    if (html.isBlank()) {
-                        _prefetchState.value = PrefetchState(forChapterUrl = nextUrl, status = PrefetchStatus.UNAVAILABLE)
-                        return@use
-                    }
-
-                    val images = UrlChapterAnalyzer.extractImagesFromHtml(html, nextUrl)
-                    if (images.isEmpty()) {
-                        _prefetchState.value = PrefetchState(forChapterUrl = nextUrl, status = PrefetchStatus.UNAVAILABLE)
-                        return@use
-                    }
-
-                    val nextNext = UrlChapterAnalyzer.extractNextChapterUrlFromHtml(html, nextUrl)
-                        ?: UrlChapterAnalyzer.predictNextChapterUrl(nextUrl)
-                    val title = UrlChapterAnalyzer.extractTitleFromHtml(html, nextUrl)
-                        .ifBlank { UrlChapterAnalyzer.extractChapterTitleFromUrl(nextUrl) }
-
-                    val nextChapter = Chapter(
-                        title = title,
+                when (
+                    val outcome = chapterLoaderRepo.loadChapter(
                         chapterUrl = nextUrl,
-                        images = images,
-                        nextChapterUrl = nextNext,
-                        prevChapterUrl = chapter.chapterUrl,
-                        isOffline = false
+                        refererUrl = chapter.chapterUrl,
+                        prevChapterUrl = chapter.chapterUrl
                     )
-                    prefetchedChapter = nextChapter
-                    _prefetchState.value = PrefetchState(
-                        forChapterUrl = nextUrl,
-                        status = PrefetchStatus.READY,
-                        chapter = nextChapter
-                    )
+                ) {
+                    is ChapterLoadOutcome.Success -> {
+                        val nextChapter = outcome.chapter
+                        prefetchedChapter = nextChapter
+                        _prefetchState.value = PrefetchState(
+                            forChapterUrl = nextUrl,
+                            status = PrefetchStatus.READY,
+                            chapter = nextChapter
+                        )
 
-                    // Preload the first 3 pages into Coil cache for instant display
-                    mangaApp?.let { app ->
-                        val loader = Coil.imageLoader(app)
-                        images.take(3).forEach { imgUrl ->
-                            val req = ImageRequest.Builder(app)
-                                .data(imgUrl)
-                                .setHeader("Referer", nextUrl)
-                                .setParameter(MangaReaderApplication.PARAM_IMAGE_URL, imgUrl)
-                                .build()
-                            loader.enqueue(req)
+                        // Preload the first 3 pages into Coil cache via imageHttpClient for instant display
+                        mangaApp?.let { app ->
+                            val loader = Coil.imageLoader(app)
+                            nextChapter.images.take(3).forEach { imgUrl ->
+                                val req = ImageRequest.Builder(app)
+                                    .data(imgUrl)
+                                    .setHeader("Referer", nextChapter.chapterUrl)
+                                    .setParameter(MangaReaderApplication.PARAM_IMAGE_URL, imgUrl, memoryCacheKey = null)
+                                    .diskCacheKey(imgUrl)
+                                    .memoryCacheKey(imgUrl)
+                                    .build()
+                                loader.enqueue(req)
+                            }
                         }
                     }
-                    Unit
+                    else -> {
+                        _prefetchState.value = PrefetchState(
+                            forChapterUrl = nextUrl,
+                            status = PrefetchStatus.UNAVAILABLE
+                        )
+                    }
                 }
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 _prefetchState.value = PrefetchState(forChapterUrl = nextUrl, status = PrefetchStatus.UNAVAILABLE)
             } finally {
                 isPrefetchInProgress = false
@@ -1065,37 +1250,24 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun readLimitedString(stream: java.io.InputStream, maxBytes: Int): String {
-        val out = ByteArrayOutputStream()
-        val buffer = ByteArray(8192)
-        var total = 0
-        while (total < maxBytes) {
-            val read = stream.read(buffer, 0, minOf(buffer.size, maxBytes - total))
-            if (read <= 0) break
-            out.write(buffer, 0, read)
-            total += read
-        }
-        return out.toString(Charsets.UTF_8.name())
-    }
-
     // --- Assistant (Multi-Turn Gemini Chat) ---
 
     fun selectPersona(persona: ChatPersonaId) {
         _selectedPersona.value = persona
-        chatRepo.savePersonaSync(persona)
+        viewModelScope.launch { chatRepo.savePersona(persona) }
     }
 
     fun selectModel(model: ChatModelId) {
         _selectedModel.value = model
-        chatRepo.saveModelSync(model)
+        viewModelScope.launch { chatRepo.saveModel(model) }
     }
 
     fun saveApiKey(rawKey: String) {
         val cleaned = rawKey.trim()
         _apiKey.value = cleaned
         _hasApiKey.value = cleaned.isNotBlank()
-        chatRepo.saveApiKeySync(cleaned)
         viewModelScope.launch {
+            chatRepo.saveApiKey(cleaned)
             _uiEvents.emit(
                 UiEvent.ShowSnackbar(
                     if (cleaned.isNotBlank()) "Gemini-API-Schlüssel gespeichert." else "Gemini-API-Schlüssel entfernt."
@@ -1209,19 +1381,61 @@ class MangaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun scheduleSaveChatHistory() {
+        hasPendingChatWrite = true
         persistChatJob?.cancel()
         persistChatJob = viewModelScope.launch {
             delay(350)
+            hasPendingChatWrite = false
             chatRepo.saveMessages(_chatMessages.value)
         }
     }
 
     override fun onCleared() {
         super.onCleared()
-        runBlocking {
-            sessionManager.saveSession(_tabs.value, _activeWebTabId.value, _readerMode.value)
-            libraryRepo.saveItems(_bookmarks.value + _history.value)
-            chatRepo.saveMessages(_chatMessages.value)
+        // Asynchroner Abschluss-Flush über applicationScope — kein runBlocking auf dem Main-Thread!
+        val flushScope = mangaApp?.applicationScope ?: return
+        val tabsSnapshot = _tabs.value
+        val activeIdSnapshot = _activeWebTabId.value
+        val modeSnapshot = _readerMode.value
+        val prefsSnapshot = _readerPreferences.value
+        val progressChapter = pendingProgressChapter
+        val progressTitle = pendingProgressDisplayTitle
+        val progressPage = pendingProgressPage
+        val chatSnapshot = _chatMessages.value
+        val shouldFlushSession = hasPendingSessionWrite && tabsSnapshot.isNotEmpty()
+        val shouldFlushPrefs = persistPreferencesJob?.isActive == true
+        val shouldFlushCacheLimit = persistCacheLimitJob?.isActive == true
+        val cacheLimitBytesSnapshot = ChapterCacheManager.mbToBytes(_cacheLimitMb.value)
+        val shouldFlushChat = hasPendingChatWrite
+
+        flushScope.launch(Dispatchers.IO) {
+            if (shouldFlushSession) {
+                runCatching { sessionManager.saveSession(tabsSnapshot, activeIdSnapshot, modeSnapshot) }
+            }
+            if (shouldFlushPrefs) {
+                runCatching { libraryRepo.savePreferences(prefsSnapshot) }
+            }
+            if (shouldFlushCacheLimit) {
+                runCatching { settingsDataStore.updateCacheLimitBytes(cacheLimitBytesSnapshot) }
+            }
+            if (progressChapter != null) {
+                runCatching {
+                    libraryRepo.recordReadingProgress(
+                        chapter = progressChapter,
+                        displayTitle = progressTitle,
+                        page = progressPage,
+                        trackHistory = prefsSnapshot.isHistoryTrackingEnabled
+                    )
+                }
+            }
+            if (shouldFlushChat) {
+                runCatching { chatRepo.saveMessages(chatSnapshot) }
+            }
         }
+    }
+
+    companion object {
+        private const val DEFAULT_START_TITLE = "Startseite"
+        private const val DEFAULT_START_URL = "https://mangadex.org"
     }
 }

@@ -7,6 +7,8 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.mangareader.app.MangaReaderApplication
 import com.mangareader.app.data.extractor.UrlChapterAnalyzer
+import com.mangareader.app.data.local.DownloadedChapterEntity
+import com.mangareader.app.data.local.MangaDatabase
 import com.mangareader.app.data.network.BitmapDecodeGuard
 import com.mangareader.app.util.AppConstants
 import com.mangareader.app.util.UrlSafety
@@ -24,7 +26,7 @@ class MangaDownloadWorker(
 ) : CoroutineWorker(appContext, workerParams) {
 
     private val httpClient: OkHttpClient by lazy {
-        (applicationContext as? MangaReaderApplication)?.okHttpClient
+        (applicationContext as? MangaReaderApplication)?.imageHttpClient
             ?: OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(20, TimeUnit.SECONDS)
@@ -117,10 +119,16 @@ class MangaDownloadWorker(
                     }
 
                     val contentType = response.header("Content-Type")
-                    val peekPrefix = runCatching { response.peekBody(256).string() }.getOrDefault("")
-                    val challengeType = BitmapDecodeGuard.detectSecurityChallengeContentType(contentType, peekPrefix)
-                    if (challengeType != null || (!contentType.isNullOrBlank() && !BitmapDecodeGuard.isValidImageContentType(contentType))) {
-                        // Never save HTML/XML challenge pages as offline images
+                    val peekBytes = runCatching {
+                        response.peekBody(BitmapDecodeGuard.INSPECTION_PREFIX_BYTES.toLong()).bytes()
+                    }.getOrDefault(ByteArray(0))
+                    val challengeType = BitmapDecodeGuard.detectSecurityChallengeContentType(contentType, peekBytes)
+                    val validMagic = BitmapDecodeGuard.hasValidImageMagicBytes(
+                        bufferPrefix = peekBytes,
+                        contentType = if (BitmapDecodeGuard.isValidImageContentType(contentType)) contentType else null
+                    )
+                    if (challengeType != null || !validMagic) {
+                        // Never save HTML/XML challenge pages or corrupt non-image payloads as offline images
                         return@use
                     }
 
@@ -160,6 +168,7 @@ class MangaDownloadWorker(
             return Result.failure(workDataOf("ERROR" to "Download fehlgeschlagen - keine gültigen Bilder geladen."))
         }
 
+        val completedAt = System.currentTimeMillis()
         try {
             val metaFile = File(downloadDir, "metadata.json")
             val meta = JSONObject().apply {
@@ -167,7 +176,7 @@ class MangaDownloadWorker(
                 put("title", chapterTitle)
                 put("sourceUrl", sourceUrl)
                 put("totalPages", downloadedFiles.size)
-                put("timestamp", System.currentTimeMillis())
+                put("timestamp", completedAt)
                 val filesArr = JSONArray()
                 downloadedFiles.forEach { filesArr.put(it) }
                 put("files", filesArr)
@@ -175,6 +184,22 @@ class MangaDownloadWorker(
             metaFile.writeText(meta.toString(2))
         } catch (e: Exception) {
             e.printStackTrace()
+        }
+
+        // Persist directly in Room so LibraryScreen updates reactively via Flow
+        runCatching {
+            val db = (applicationContext as? MangaReaderApplication)?.database
+                ?: MangaDatabase.getInstance(applicationContext)
+            db.downloadedChapterDao().upsert(
+                DownloadedChapterEntity(
+                    id = folderName,
+                    title = chapterTitle,
+                    sourceUrl = sourceUrl,
+                    imageFilePaths = downloadedFiles.toList(),
+                    downloadTimestamp = completedAt,
+                    totalPages = downloadedFiles.size
+                )
+            )
         }
 
         jobFilePath?.let { File(it).delete() }

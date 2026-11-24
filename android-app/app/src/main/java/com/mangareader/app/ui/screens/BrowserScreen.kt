@@ -4,12 +4,15 @@ import android.annotation.SuppressLint
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.TextView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -93,6 +96,7 @@ import com.mangareader.app.ui.theme.DarkCardBg
 import com.mangareader.app.ui.theme.DarkInputBg
 import com.mangareader.app.ui.theme.DarkSurface
 import com.mangareader.app.ui.theme.MonoFontFamily
+import com.mangareader.app.ui.theme.PureAmoledBlack
 import com.mangareader.app.ui.theme.TextSecondary
 import com.mangareader.app.ui.viewmodel.MangaViewModel
 import com.mangareader.app.ui.viewmodel.UiEvent
@@ -175,7 +179,7 @@ fun BrowserScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(DarkBackground)
+            .background(PureAmoledBlack)
     ) {
         // --- 1. Multi-Tab Strip (GitHub BrowserView style: 152dp..220dp tabs + isolated 24dp close) ---
         Row(
@@ -559,68 +563,88 @@ fun BrowserScreen(
                                 }
                             )
                     ) {
-                        AndroidView(
+                        AndroidView<View>(
                             factory = { ctx ->
-                                WebView(ctx).apply {
-                                    layoutParams = ViewGroup.LayoutParams(
-                                        ViewGroup.LayoutParams.MATCH_PARENT,
-                                        ViewGroup.LayoutParams.MATCH_PARENT
-                                    )
+                                runCatching {
+                                    WebView(ctx).apply {
+                                        layoutParams = ViewGroup.LayoutParams(
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                            ViewGroup.LayoutParams.MATCH_PARENT
+                                        )
 
-                                    settings.apply {
-                                        javaScriptEnabled = true
-                                        domStorageEnabled = true
-                                        databaseEnabled = true
-                                        loadsImagesAutomatically = true
-                                        useWideViewPort = true
-                                        loadWithOverviewMode = true
-                                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                                        userAgentString = AppConstants.USER_AGENT
-                                    }
+                                        settings.apply {
+                                            javaScriptEnabled = true
+                                            domStorageEnabled = true
+                                            databaseEnabled = true
+                                            loadsImagesAutomatically = true
+                                            useWideViewPort = true
+                                            loadWithOverviewMode = true
+                                            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                                            userAgentString = AppConstants.USER_AGENT
+                                        }
 
-                                    CookieManager.getInstance().setAcceptCookie(true)
-                                    CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                                        runCatching {
+                                            CookieManager.getInstance().setAcceptCookie(true)
+                                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                                        }
 
-                                    webViewClient = object : WebViewClient() {
-                                        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                                            super.onPageStarted(view, url, favicon)
-                                            canGoBackMap[tab.id] = view?.canGoBack() == true
-                                            canGoForwardMap[tab.id] = view?.canGoForward() == true
-                                            if (tab.id == viewModel.activeWebTabId.value) {
-                                                url?.let { viewModel.onWebPageStarted(it) }
+                                        webViewClient = object : WebViewClient() {
+                                            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                                                super.onPageStarted(view, url, favicon)
+                                                canGoBackMap[tab.id] = view?.canGoBack() == true
+                                                canGoForwardMap[tab.id] = view?.canGoForward() == true
+                                                if (tab.id == viewModel.activeWebTabId.value) {
+                                                    url?.let { viewModel.onWebPageStarted(it) }
+                                                }
+                                            }
+
+                                            override fun onPageFinished(view: WebView?, url: String?) {
+                                                super.onPageFinished(view, url)
+                                                runCatching { CookieManager.getInstance().flush() }
+                                                canGoBackMap[tab.id] = view?.canGoBack() == true
+                                                canGoForwardMap[tab.id] = view?.canGoForward() == true
+                                                val title = view?.title ?: ""
+                                                if (tab.id == viewModel.activeWebTabId.value) {
+                                                    url?.let { viewModel.onWebPageFinished(it, title) }
+                                                }
                                             }
                                         }
 
-                                        override fun onPageFinished(view: WebView?, url: String?) {
-                                            super.onPageFinished(view, url)
-                                            runCatching { CookieManager.getInstance().flush() }
-                                            canGoBackMap[tab.id] = view?.canGoBack() == true
-                                            canGoForwardMap[tab.id] = view?.canGoForward() == true
-                                            val title = view?.title ?: ""
-                                            if (tab.id == viewModel.activeWebTabId.value) {
-                                                url?.let { viewModel.onWebPageFinished(it, title) }
+                                        webChromeClient = object : WebChromeClient() {
+                                            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                                                super.onProgressChanged(view, newProgress)
+                                                if (tab.id == viewModel.activeWebTabId.value) {
+                                                    viewModel.onWebProgressChanged(newProgress)
+                                                }
                                             }
                                         }
-                                    }
 
-                                    webChromeClient = object : WebChromeClient() {
-                                        override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                                            super.onProgressChanged(view, newProgress)
-                                            if (tab.id == viewModel.activeWebTabId.value) {
-                                                viewModel.onWebProgressChanged(newProgress)
-                                            }
-                                        }
+                                        loadUrl(tab.url)
+                                        webViewMap[tab.id] = this
                                     }
-
-                                    loadUrl(tab.url)
-                                    webViewMap[tab.id] = this
+                                }.getOrElse {
+                                    TextView(ctx).apply {
+                                        layoutParams = ViewGroup.LayoutParams(
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                            ViewGroup.LayoutParams.MATCH_PARENT
+                                        )
+                                        setBackgroundColor(android.graphics.Color.BLACK)
+                                        setTextColor(android.graphics.Color.parseColor("#A29BBE"))
+                                        gravity = Gravity.CENTER
+                                        text = "Android System WebView ist auf diesem Gerät aktuell nicht verfügbar."
+                                    }
                                 }
                             },
-                            onRelease = { wv ->
+                            onRelease = { view ->
                                 webViewMap.remove(tab.id)
                                 canGoBackMap.remove(tab.id)
                                 canGoForwardMap.remove(tab.id)
-                                wv.destroy()
+                                if (view is WebView) {
+                                    runCatching {
+                                        (view.parent as? ViewGroup)?.removeView(view)
+                                        view.destroy()
+                                    }
+                                }
                             },
                             modifier = Modifier.fillMaxSize()
                         )
@@ -632,7 +656,12 @@ fun BrowserScreen(
 
     DisposableEffect(Unit) {
         onDispose {
-            webViewMap.values.forEach { it.destroy() }
+            webViewMap.values.forEach { wv ->
+                runCatching {
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                    wv.destroy()
+                }
+            }
             webViewMap.clear()
         }
     }

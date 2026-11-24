@@ -93,4 +93,24 @@ class UrlChapterAnalyzerTest {
             UrlChapterAnalyzer.extractTitleFromHtml(html, "https://manga.example.com/read/ch12")
         )
     }
+
+    @Test
+    fun `extractImagesFromHtml supports data-srcset and extractNextChapterUrlFromHtml detects rel next and classes`() {
+        val html = """
+            <html>
+              <body>
+                <img src="/img/placeholder.png" />
+                <img data-srcset="https://cdn.example.com/p1.webp 1x, https://cdn.example.com/p1_2x.webp 2x" />
+                <a class="navi-change-chapter-next" href="/manga/series/chapter-13">Weiterlesen</a>
+              </body>
+            </html>
+        """.trimIndent()
+
+        val images = UrlChapterAnalyzer.extractImagesFromHtml(html, "https://manga.example.com/manga/series/chapter-12")
+        assertEquals(listOf("https://cdn.example.com/p1.webp"), images)
+        assertEquals(
+            "https://manga.example.com/manga/series/chapter-13",
+            UrlChapterAnalyzer.extractNextChapterUrlFromHtml(html, "https://manga.example.com/manga/series/chapter-12")
+        )
+    }
 }

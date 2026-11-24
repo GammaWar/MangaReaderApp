@@ -68,6 +68,7 @@ import com.mangareader.app.data.model.AppTab
 import com.mangareader.app.data.model.ReaderMode
 import com.mangareader.app.data.model.ReaderPreferences
 import com.mangareader.app.data.model.ReadingDirection
+import com.mangareader.app.ui.screens.reader.AutoScrollLogic
 import com.mangareader.app.ui.theme.AccentPrimary
 import com.mangareader.app.ui.theme.AccentPrimaryLight
 import com.mangareader.app.ui.theme.BodyFontFamily
@@ -391,11 +392,42 @@ fun SettingsBottomSheet(
                     )
 
                     if (preferences.isAutoScrollEnabled) {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = "Scroll-Geschwindigkeit (stufenlos)",
+                                    fontFamily = BodyFontFamily,
+                                    fontSize = 12.sp,
+                                    color = Color(0xFFB8B2D4)
+                                )
+                                Text(
+                                    text = AutoScrollLogic.formatSpeedLabel(preferences.autoScrollSpeed),
+                                    fontFamily = MonoFontFamily,
+                                    fontWeight = FontWeight.Medium,
+                                    fontSize = 12.sp,
+                                    color = Color(0xFFE5DCFF)
+                                )
+                            }
+                            Slider(
+                                value = AutoScrollLogic.clampSpeed(preferences.autoScrollSpeed),
+                                onValueChange = { viewModel.setAutoScrollSpeed(it) },
+                                valueRange = AutoScrollLogic.MIN_SPEED..AutoScrollLogic.MAX_SPEED,
+                                colors = SliderDefaults.colors(
+                                    thumbColor = AccentPrimaryLight,
+                                    activeTrackColor = AccentPrimary,
+                                    inactiveTrackColor = Color(0xFF241F3A)
+                                )
+                            )
+                        }
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            listOf(0.5f, 1.0f, 1.5f, 2.0f, 3.0f).forEach { spd ->
+                            AutoScrollLogic.SPEED_PRESETS.forEach { spd ->
                                 val selected = abs(preferences.autoScrollSpeed - spd) < 0.05f
                                 Surface(
                                     onClick = { viewModel.setAutoScrollSpeed(spd) },
@@ -408,7 +440,7 @@ fun SettingsBottomSheet(
                                 ) {
                                     Box(contentAlignment = Alignment.Center) {
                                         Text(
-                                            text = "${String.format(Locale.US, "%.1f", spd)}x",
+                                            text = AutoScrollLogic.formatSpeedLabel(spd),
                                             fontFamily = MonoFontFamily,
                                             fontWeight = FontWeight.Medium,
                                             fontSize = 12.sp,

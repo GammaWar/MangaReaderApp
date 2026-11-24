@@ -1,6 +1,6 @@
 # MangaReaderApp — Native Android App (v2.1)
 
-Eigenständiges natives **Android-Studio-Projekt (Kotlin + Jetpack Compose + Material 3)** im **1:1 AMOLED-Dunkeldesign (`#000000` / `#0B0A12`)**, entwickelt ohne Veränderung der Web-App im Hauptverzeichnis.
+Eigenständiges natives **Android-Studio-Projekt (Kotlin + Jetpack Compose + Material 3)** im **1:1 AMOLED-Dunkeldesign (`#000000` / `#0B0A12`)**, sauber getrennt von der Web-Version unter `web-app/`.
 
 ---
 
@@ -42,4 +42,4 @@ KEYSTORE_PASSWORD="..." KEY_ALIAS="mangareader" KEY_PASSWORD="..." ./gradlew ass
 ```
 
 ### 3. GitHub Actions CI
-Die vorbereitete Workflow-Datei `android-app/ci/build-android-apk.yml` nach `.github/workflows/build-android-apk.yml` kopieren — führt automatisch Unit-Tests + `assembleDebug` aus und lädt die APK als Workflow-Artifact hoch.
+Die Workflow-Datei [`.github/workflows/build-apk.yml`](../.github/workflows/build-apk.yml) führt bei jedem Push automatisch `./gradlew testDebugUnitTest assembleDebug` aus und lädt `app-debug.apk` als herunterladbares Workflow-Artifact hoch.

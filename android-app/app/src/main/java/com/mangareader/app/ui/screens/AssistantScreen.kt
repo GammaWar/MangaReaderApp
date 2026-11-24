@@ -87,6 +87,7 @@ import com.mangareader.app.ui.theme.DisplayFontFamily
 import com.mangareader.app.ui.theme.ErrorColor
 import com.mangareader.app.ui.theme.HairlineBorder
 import com.mangareader.app.ui.theme.MonoFontFamily
+import com.mangareader.app.ui.theme.PureAmoledBlack
 import com.mangareader.app.ui.theme.TextSecondary
 import com.mangareader.app.ui.theme.WarningAmber
 import com.mangareader.app.ui.viewmodel.MangaViewModel
@@ -120,7 +121,7 @@ fun AssistantScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .background(DarkBackground)
+            .background(PureAmoledBlack)
     ) {
         // --- Header: Title, Model Speed Switch, Key, Reset & Persona Cards (GitHub ChatView style) ---
         Column(

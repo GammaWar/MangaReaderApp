@@ -1,148 +1,193 @@
 package com.mangareader.app.data.library
 
 import android.content.Context
+import com.mangareader.app.data.local.BookmarkDao
+import com.mangareader.app.data.local.BookmarkEntity
+import com.mangareader.app.data.local.MangaDatabase
+import com.mangareader.app.data.local.ReadingProgressDao
+import com.mangareader.app.data.local.ReadingProgressEntity
 import com.mangareader.app.data.model.BookmarkItem
+import com.mangareader.app.data.model.Chapter
 import com.mangareader.app.data.model.ReaderPreferences
-import com.mangareader.app.data.model.ReadingDirection
+import com.mangareader.app.data.settings.SettingsDataStore
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.File
+import java.util.UUID
 
-class LibraryRepository(private val context: Context) {
+/**
+ * Reaktives Bibliotheks-Repository auf Basis von Room (`BookmarkDao`, `ReadingProgressDao`)
+ * und Jetpack DataStore (`SettingsDataStore`) — vollständig asynchron ohne Main-Thread-I/O.
+ */
+class LibraryRepository(
+    private val bookmarkDao: BookmarkDao,
+    private val readingProgressDao: ReadingProgressDao,
+    private val settingsDataStore: SettingsDataStore
+) {
+    constructor(
+        context: Context,
+        database: MangaDatabase = MangaDatabase.getInstance(context),
+        settingsDataStore: SettingsDataStore = SettingsDataStore(context)
+    ) : this(
+        bookmarkDao = database.bookmarkDao(),
+        readingProgressDao = database.readingProgressDao(),
+        settingsDataStore = settingsDataStore
+    )
 
-    private val libraryFile = File(context.filesDir, "library_bookmarks.json")
-    private val preferencesFile = File(context.filesDir, "reader_preferences.json")
-    private val writeMutex = Mutex()
+    val bookmarksFlow: Flow<List<BookmarkItem>> = combine(
+        bookmarkDao.observeBookmarks(),
+        readingProgressDao.observeAll()
+    ) { entities, progressList ->
+        val progressByUrl = progressList.associateBy { it.chapterUrl }
+        entities.map { entity -> enrichWithProgress(entity.toDomain(), progressByUrl[entity.chapterUrl]) }
+    }
 
-    // --- Bookmarks & History ---
+    val historyFlow: Flow<List<BookmarkItem>> = combine(
+        bookmarkDao.observeHistory(),
+        readingProgressDao.observeAll()
+    ) { entities, progressList ->
+        val progressByUrl = progressList.associateBy { it.chapterUrl }
+        entities.map { entity -> enrichWithProgress(entity.toDomain(), progressByUrl[entity.chapterUrl]) }
+    }
 
-    fun loadItemsSync(): List<BookmarkItem> {
-        try {
-            if (!libraryFile.exists()) return emptyList()
-            val text = libraryFile.readText()
-            if (text.isBlank()) return emptyList()
+    val readingProgressFlow: Flow<Map<String, ReadingProgressEntity>> =
+        readingProgressDao.observeAll().map { list -> list.associateBy { it.chapterUrl } }
 
-            val array = JSONArray(text)
-            val items = mutableListOf<BookmarkItem>()
-            for (i in 0 until array.length()) {
-                val obj = array.getJSONObject(i)
-                items.add(
-                    BookmarkItem(
-                        id = obj.optString("id", java.util.UUID.randomUUID().toString()),
-                        title = obj.optString("title", ""),
-                        chapterTitle = obj.optString("chapterTitle", ""),
-                        chapterUrl = obj.optString("chapterUrl", ""),
-                        coverImageUrl = obj.optString("coverImageUrl").takeIf { it.isNotBlank() && it != "null" },
-                        lastReadPage = obj.optInt("lastReadPage", 0),
-                        totalPages = obj.optInt("totalPages", 0),
-                        timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
-                        isBookmark = obj.optBoolean("isBookmark", true)
+    val readerPreferencesFlow: Flow<ReaderPreferences> = settingsDataStore.readerPreferencesFlow
+
+    /**
+     * Schaltet ein Kapitel-Lesezeichen um und gibt `true` zurück, wenn es hinzugefügt wurde,
+     * bzw. `false`, wenn ein vorhandenes Lesezeichen entfernt wurde.
+     */
+    suspend fun toggleBookmark(
+        chapter: Chapter,
+        displayTitle: String,
+        currentPage: Int
+    ): Boolean = withContext(Dispatchers.IO) {
+        val url = chapter.chapterUrl
+        val existing = bookmarkDao.getBookmarkByUrl(url)
+        if (existing != null) {
+            bookmarkDao.deleteById(existing.id)
+            false
+        } else {
+            val now = System.currentTimeMillis()
+            val safePage = currentPage.coerceAtLeast(0)
+            val safeTitle = displayTitle.ifBlank { chapter.title }
+            val entity = BookmarkEntity(
+                id = UUID.randomUUID().toString(),
+                title = safeTitle,
+                chapterTitle = chapter.title,
+                chapterUrl = url,
+                coverImageUrl = chapter.images.firstOrNull(),
+                lastReadPage = safePage,
+                totalPages = chapter.images.size,
+                timestamp = now,
+                isBookmark = true
+            )
+            bookmarkDao.upsert(entity)
+            if (url.isNotBlank()) {
+                readingProgressDao.upsert(
+                    ReadingProgressEntity(
+                        chapterUrl = url,
+                        seriesTitle = safeTitle,
+                        chapterTitle = chapter.title,
+                        lastReadPage = safePage,
+                        totalPages = chapter.images.size,
+                        updatedAt = now
                     )
                 )
             }
-            return items
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return emptyList()
+            true
         }
     }
 
-    suspend fun saveItems(items: List<BookmarkItem>) = withContext(Dispatchers.IO) {
-        writeMutex.withLock {
-            try {
-                val array = JSONArray()
-                items.forEach { item ->
-                    val obj = JSONObject().apply {
-                        put("id", item.id)
-                        put("title", item.title)
-                        put("chapterTitle", item.chapterTitle)
-                        put("chapterUrl", item.chapterUrl)
-                        item.coverImageUrl?.let { put("coverImageUrl", it) }
-                        put("lastReadPage", item.lastReadPage)
-                        put("totalPages", item.totalPages)
-                        put("timestamp", item.timestamp)
-                        put("isBookmark", item.isBookmark)
-                    }
-                    array.put(obj)
-                }
+    /**
+     * Persistiert die exakte Leseposition in `reading_progress`, hält vorhandene Lesezeichen
+     * synchron und schreibt bei aktiviertem Verlauf den chronologischen Verlaufseintrag.
+     */
+    suspend fun recordReadingProgress(
+        chapter: Chapter,
+        displayTitle: String,
+        page: Int,
+        trackHistory: Boolean
+    ) = withContext(Dispatchers.IO) {
+        val url = chapter.chapterUrl.ifBlank { chapter.title }
+        if (url.isBlank()) return@withContext
 
-                // Atomic temp-file write to prevent data corruption
-                val tempFile = File(context.filesDir, "library_bookmarks.tmp")
-                tempFile.writeText(array.toString())
-                if (libraryFile.exists()) {
-                    libraryFile.delete()
-                }
-                if (!tempFile.renameTo(libraryFile)) {
-                    libraryFile.writeText(array.toString())
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-    }
+        val now = System.currentTimeMillis()
+        val safePage = page.coerceAtLeast(0)
+        val totalPages = chapter.images.size
+        val safeTitle = displayTitle.ifBlank { chapter.title }
 
-    // --- Reader Preferences (History toggle, Pre-fetch, Autoscroll, Brightness, Night Mode, Direction, KeepScreenOn) ---
-
-    fun loadPreferencesSync(): ReaderPreferences {
-        try {
-            if (!preferencesFile.exists()) return ReaderPreferences()
-            val text = preferencesFile.readText()
-            if (text.isBlank()) return ReaderPreferences()
-
-            val obj = JSONObject(text)
-            val directionName = obj.optString("readingDirection", ReadingDirection.RTL.name)
-            val direction = runCatching { ReadingDirection.valueOf(directionName) }
-                .getOrDefault(ReadingDirection.RTL)
-
-            return ReaderPreferences(
-                isHistoryTrackingEnabled = obj.optBoolean("isHistoryTrackingEnabled", true),
-                isAutoScrollEnabled = obj.optBoolean("isAutoScrollEnabled", true),
-                autoScrollSpeed = obj.optDouble("autoScrollSpeed", 1.0).toFloat(),
-                isPrefetchEnabled = obj.optBoolean("isPrefetchEnabled", true),
-                isCustomBrightnessEnabled = obj.optBoolean("isCustomBrightnessEnabled", false),
-                brightnessLevel = obj.optDouble("brightnessLevel", 1.0).toFloat(),
-                isNightFilterEnabled = obj.optBoolean("isNightFilterEnabled", false),
-                nightFilterStrength = obj.optDouble("nightFilterStrength", 0.35).toFloat(),
-                readingDirection = direction,
-                keepScreenOn = obj.optBoolean("keepScreenOn", true)
+        readingProgressDao.upsert(
+            ReadingProgressEntity(
+                chapterUrl = url,
+                seriesTitle = safeTitle,
+                chapterTitle = chapter.title,
+                lastReadPage = safePage,
+                totalPages = totalPages,
+                updatedAt = now
             )
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return ReaderPreferences()
+        )
+
+        bookmarkDao.updateBookmarkProgress(
+            chapterUrl = url,
+            lastReadPage = safePage,
+            totalPages = totalPages,
+            timestamp = now
+        )
+
+        if (trackHistory) {
+            bookmarkDao.upsertHistoryAndTrim(
+                entity = BookmarkEntity(
+                    id = UUID.randomUUID().toString(),
+                    title = safeTitle,
+                    chapterTitle = chapter.title,
+                    chapterUrl = url,
+                    coverImageUrl = chapter.images.firstOrNull(),
+                    lastReadPage = safePage,
+                    totalPages = totalPages,
+                    timestamp = now,
+                    isBookmark = false
+                ),
+                maxEntries = MAX_HISTORY_ITEMS
+            )
         }
     }
 
-    suspend fun savePreferences(prefs: ReaderPreferences) = withContext(Dispatchers.IO) {
-        writeMutex.withLock {
-            try {
-                val obj = JSONObject().apply {
-                    put("isHistoryTrackingEnabled", prefs.isHistoryTrackingEnabled)
-                    put("isAutoScrollEnabled", prefs.isAutoScrollEnabled)
-                    put("autoScrollSpeed", prefs.autoScrollSpeed.toDouble())
-                    put("isPrefetchEnabled", prefs.isPrefetchEnabled)
-                    put("isCustomBrightnessEnabled", prefs.isCustomBrightnessEnabled)
-                    put("brightnessLevel", prefs.brightnessLevel.toDouble())
-                    put("isNightFilterEnabled", prefs.isNightFilterEnabled)
-                    put("nightFilterStrength", prefs.nightFilterStrength.toDouble())
-                    put("readingDirection", prefs.readingDirection.name)
-                    put("keepScreenOn", prefs.keepScreenOn)
-                }
-
-                val tempFile = File(context.filesDir, "reader_preferences.tmp")
-                tempFile.writeText(obj.toString())
-                if (preferencesFile.exists()) {
-                    preferencesFile.delete()
-                }
-                if (!tempFile.renameTo(preferencesFile)) {
-                    preferencesFile.writeText(obj.toString())
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
+    suspend fun getReadingProgress(chapterUrl: String): ReadingProgressEntity? =
+        withContext(Dispatchers.IO) {
+            if (chapterUrl.isBlank()) return@withContext null
+            readingProgressDao.getByChapterUrl(chapterUrl)
         }
+
+    suspend fun deleteItem(id: String) = withContext(Dispatchers.IO) {
+        bookmarkDao.deleteById(id)
+    }
+
+    suspend fun clearHistory() = withContext(Dispatchers.IO) {
+        bookmarkDao.clearHistory()
+    }
+
+    suspend fun savePreferences(prefs: ReaderPreferences) {
+        settingsDataStore.updateReaderPreferences(prefs)
+    }
+
+    private fun enrichWithProgress(
+        item: BookmarkItem,
+        progress: ReadingProgressEntity?
+    ): BookmarkItem {
+        if (progress == null || progress.updatedAt < item.timestamp) return item
+        return item.copy(
+            lastReadPage = progress.lastReadPage,
+            totalPages = if (progress.totalPages > 0) progress.totalPages else item.totalPages,
+            timestamp = maxOf(item.timestamp, progress.updatedAt)
+        )
+    }
+
+    companion object {
+        const val MAX_HISTORY_ITEMS = 60
     }
 }

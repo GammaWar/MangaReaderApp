@@ -20,13 +20,30 @@ class CdnSecurityChallengeException(
 ) : IOException("Security/CDN challenge detected ($receivedContentType instead of image/*) for $imageUrl")
 
 /**
- * Exception indicating that `BitmapFactory` returned null (corrupted/incomplete bytes, not HTML/XML challenge).
+ * Exception indicating that `BitmapFactory` returned null or payload magic bytes were invalid
+ * (corrupted/incomplete/non-image bytes, not an HTML/XML challenge).
  */
 class NullBitmapDecodeException(
     val imageUrl: String,
     val receivedContentType: String? = null,
     cause: Throwable? = null
 ) : IOException("BitmapFactory returned a null bitmap for $imageUrl (${receivedContentType ?: "unknown"})", cause)
+
+/**
+ * Exception thrown when an HTML chapter page exceeds the 4-MB safety cap.
+ */
+class ChapterPayloadTooLargeException(
+    val maxBytes: Long,
+    val url: String = ""
+) : IOException("Kapitelseite überschreitet das zulässige ${maxBytes / (1024 * 1024)}-MB-Größenlimit${if (url.isNotBlank()) " ($url)" else ""}.")
+
+/**
+ * Exception thrown when a request or redirect target is blocked by SSRF URL safety checks.
+ */
+class SsrfBlockedException(
+    val targetUrl: String,
+    val reason: String
+) : IOException(reason)
 
 enum class DiagnosticKind {
     HTTP_404,
@@ -68,19 +85,46 @@ data class BufferVerificationResult(
 
 object BitmapDecodeGuard {
     private const val TAG = "BitmapDecodeGuard"
+    const val INSPECTION_PREFIX_BYTES: Int = 1024
+
+    val SAFE_IMAGE_CONTENT_TYPES: Set<String> = setOf(
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/webp",
+        "image/gif",
+        "image/bmp",
+        "image/avif",
+        "image/x-icon",
+        "image/vnd.microsoft.icon"
+    )
 
     fun normalizeContentType(contentType: String?): String {
         if (contentType.isNullOrBlank()) return ""
         return contentType.substringBefore(';').trim().lowercase()
     }
 
+    private fun decodePrefix(prefixBytes: ByteArray): String {
+        val len = minOf(prefixBytes.size, INSPECTION_PREFIX_BYTES)
+        return String(prefixBytes, 0, len, Charsets.UTF_8)
+            .removePrefix("\uFEFF")
+            .trimStart()
+            .lowercase()
+    }
+
+    private fun normalizePrefixString(prefix: String): String {
+        return prefix.take(INSPECTION_PREFIX_BYTES)
+            .removePrefix("\uFEFF")
+            .trimStart()
+            .lowercase()
+    }
+
     fun isXmlPayload(prefixBytes: ByteArray): Boolean {
-        val text = String(prefixBytes, 0, minOf(prefixBytes.size, 256), Charsets.UTF_8)
-        return isXmlPayload(text)
+        return isXmlPayload(decodePrefix(prefixBytes))
     }
 
     fun isXmlPayload(prefix: String): Boolean {
-        val trimmed = prefix.take(256).trimStart().lowercase()
+        val trimmed = normalizePrefixString(prefix)
         return trimmed.startsWith("<?xml") ||
             trimmed.startsWith("<error>") ||
             trimmed.startsWith("<error ") ||
@@ -88,12 +132,11 @@ object BitmapDecodeGuard {
     }
 
     fun isHtmlPayload(prefixBytes: ByteArray): Boolean {
-        val text = String(prefixBytes, 0, minOf(prefixBytes.size, 256), Charsets.UTF_8)
-        return isHtmlPayload(text)
+        return isHtmlPayload(decodePrefix(prefixBytes))
     }
 
     fun isHtmlPayload(prefix: String): Boolean {
-        val trimmed = prefix.take(256).trimStart().lowercase()
+        val trimmed = normalizePrefixString(prefix)
         return trimmed.startsWith("<!doctype html") ||
             trimmed.startsWith("<!doctype") ||
             trimmed.startsWith("<html") ||
@@ -120,7 +163,102 @@ object BitmapDecodeGuard {
         val normalized = normalizeContentType(contentType)
         if (normalized.isEmpty()) return false
         if (isChallengeContentType(normalized) || normalized.startsWith("text/")) return false
-        return normalized.startsWith("image/")
+        return SAFE_IMAGE_CONTENT_TYPES.contains(normalized)
+    }
+
+    fun resolveSafeImageContentType(contentType: String?): String? {
+        val normalized = normalizeContentType(contentType)
+        if (!SAFE_IMAGE_CONTENT_TYPES.contains(normalized)) return null
+        return if (normalized == "image/jpg") "image/jpeg" else normalized
+    }
+
+    /**
+     * Validates that a received payload is non-empty and begins with known raster image magic bytes
+     * (JPEG, PNG, WebP, GIF, BMP, AVIF/HEIF, ICO). Rejects 0-byte bodies, JSON errors, plain text,
+     * HTML/XML challenges, and SVG documents to prevent cache poisoning and null-bitmap errors.
+     */
+    fun hasValidImageMagicBytes(
+        bufferPrefix: ByteArray?,
+        contentType: String? = null
+    ): Boolean {
+        if (bufferPrefix == null || bufferPrefix.size < 2) return false
+        if (contentType != null && !isValidImageContentType(contentType)) return false
+
+        val b = bufferPrefix
+        val len = b.size
+
+        fun u8(index: Int): Int = b[index].toInt() and 0xff
+
+        // JPEG: FF D8 FF
+        if (len >= 3 && u8(0) == 0xff && u8(1) == 0xd8 && u8(2) == 0xff) {
+            return true
+        }
+
+        // PNG: 89 50 4E 47 0D 0A 1A 0A
+        if (
+            len >= 8 &&
+            u8(0) == 0x89 &&
+            u8(1) == 0x50 &&
+            u8(2) == 0x4e &&
+            u8(3) == 0x47 &&
+            u8(4) == 0x0d &&
+            u8(5) == 0x0a &&
+            u8(6) == 0x1a &&
+            u8(7) == 0x0a
+        ) {
+            return true
+        }
+
+        // GIF: GIF87a or GIF89a
+        if (
+            len >= 6 &&
+            u8(0) == 0x47 &&
+            u8(1) == 0x49 &&
+            u8(2) == 0x46 &&
+            u8(3) == 0x38 &&
+            (u8(4) == 0x37 || u8(4) == 0x39) &&
+            u8(5) == 0x61
+        ) {
+            return true
+        }
+
+        // WebP: RIFF....WEBP
+        if (
+            len >= 12 &&
+            u8(0) == 0x52 &&
+            u8(1) == 0x49 &&
+            u8(2) == 0x46 &&
+            u8(3) == 0x46 &&
+            u8(8) == 0x57 &&
+            u8(9) == 0x45 &&
+            u8(10) == 0x42 &&
+            u8(11) == 0x50
+        ) {
+            return true
+        }
+
+        // BMP: BM
+        if (len >= 2 && u8(0) == 0x42 && u8(1) == 0x4d) {
+            return true
+        }
+
+        // AVIF / HEIF ISO-BMFF container: ....ftyp
+        if (
+            len >= 12 &&
+            u8(4) == 0x66 &&
+            u8(5) == 0x74 &&
+            u8(6) == 0x79 &&
+            u8(7) == 0x70
+        ) {
+            return true
+        }
+
+        // ICO: 00 00 01 00
+        if (len >= 4 && u8(0) == 0x00 && u8(1) == 0x00 && u8(2) == 0x01 && u8(3) == 0x00) {
+            return true
+        }
+
+        return false
     }
 
     /**
@@ -148,15 +286,22 @@ object BitmapDecodeGuard {
         return null
     }
 
+    fun detectSecurityChallengeContentType(
+        headerContentType: String?,
+        bufferPrefix: ByteArray?
+    ): String? {
+        val prefixText = bufferPrefix?.let {
+            String(it, 0, minOf(it.size, INSPECTION_PREFIX_BYTES), Charsets.UTF_8)
+        }
+        return detectSecurityChallengeContentType(headerContentType, prefixText)
+    }
+
     fun verifyReceivedImageBuffer(
         headerContentType: String?,
         bufferPrefix: ByteArray? = null
     ): BufferVerificationResult {
         val normalizedHeader = normalizeContentType(headerContentType)
-        val prefixText = bufferPrefix?.let {
-            String(it, 0, minOf(it.size, 256), Charsets.UTF_8)
-        }
-        val detectedChallenge = detectSecurityChallengeContentType(headerContentType, prefixText)
+        val detectedChallenge = detectSecurityChallengeContentType(headerContentType, bufferPrefix)
 
         if (detectedChallenge != null) {
             return BufferVerificationResult(
@@ -179,8 +324,7 @@ object BitmapDecodeGuard {
         bytes: ByteArray,
         headerContentType: String?
     ): Bitmap? {
-        val prefix = String(bytes, 0, minOf(bytes.size, 256), Charsets.UTF_8)
-        val preCheckChallenge = detectSecurityChallengeContentType(headerContentType, prefix)
+        val preCheckChallenge = detectSecurityChallengeContentType(headerContentType, bytes)
         if (preCheckChallenge != null) {
             runCatching {
                 Log.w(
@@ -193,7 +337,7 @@ object BitmapDecodeGuard {
 
         val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         if (bitmap == null) {
-            val verifiedChallenge = detectSecurityChallengeContentType(headerContentType, prefix)
+            val verifiedChallenge = detectSecurityChallengeContentType(headerContentType, bytes)
             if (verifiedChallenge != null) {
                 runCatching {
                     Log.w(

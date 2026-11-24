@@ -1,11 +1,33 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.compose.compiler)
+    alias(libs.plugins.ksp)
 }
 
+val localProps = Properties().apply {
+    val localPropsFile = rootProject.file("local.properties")
+    if (localPropsFile.exists()) {
+        localPropsFile.inputStream().use { load(it) }
+    }
+}
+
+fun signingProp(name: String, default: String = ""): String =
+    System.getenv(name)?.takeIf { it.isNotBlank() }
+        ?: (project.findProperty(name) as String?)?.takeIf { it.isNotBlank() }
+        ?: localProps.getProperty(name)?.takeIf { it.isNotBlank() }
+        ?: default
+
 val releaseKeystoreFile = file("${rootProject.rootDir}/keystore/release.keystore")
-val hasReleaseKeystore = releaseKeystoreFile.exists()
+val releaseStorePassword = signingProp("KEYSTORE_PASSWORD")
+val releaseKeyAlias = signingProp("KEY_ALIAS", "mangareader")
+val releaseKeyPassword = signingProp("KEY_PASSWORD")
+val hasReleaseKeystore =
+    releaseKeystoreFile.exists() &&
+        releaseStorePassword.isNotBlank() &&
+        releaseKeyPassword.isNotBlank()
 
 android {
     namespace = "com.mangareader.app"
@@ -28,15 +50,9 @@ android {
         signingConfigs {
             create("release") {
                 storeFile = releaseKeystoreFile
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
-                    ?: (project.findProperty("KEYSTORE_PASSWORD") as String?)
-                    ?: ""
-                keyAlias = System.getenv("KEY_ALIAS")
-                    ?: (project.findProperty("KEY_ALIAS") as String?)
-                    ?: "mangareader"
-                keyPassword = System.getenv("KEY_PASSWORD")
-                    ?: (project.findProperty("KEY_PASSWORD") as String?)
-                    ?: ""
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
                 enableV1Signing = true
                 enableV2Signing = true
                 enableV3Signing = true
@@ -79,6 +95,7 @@ android {
     }
     testOptions {
         unitTests.isReturnDefaultValues = true
+        unitTests.isIncludeAndroidResources = true
     }
 }
 
@@ -101,10 +118,21 @@ dependencies {
     // Background downloading with WorkManager
     implementation(libs.androidx.work.runtime.ktx)
 
+    // Local persistence: Room (via KSP) & Jetpack DataStore
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
+    implementation(libs.androidx.datastore.preferences)
+
     // Network & HTTP Client
     implementation(libs.okhttp)
     implementation(libs.kotlinx.coroutines.android)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
     testImplementation("junit:junit:4.13.2")
+    testImplementation(libs.okhttp.mockwebserver)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.androidx.room.testing)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core.ktx)
 }

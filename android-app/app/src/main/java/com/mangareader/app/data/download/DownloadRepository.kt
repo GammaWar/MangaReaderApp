@@ -8,6 +8,9 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.workDataOf
+import com.mangareader.app.data.local.DownloadedChapterDao
+import com.mangareader.app.data.local.DownloadedChapterEntity
+import com.mangareader.app.data.local.MangaDatabase
 import com.mangareader.app.data.model.Chapter
 import com.mangareader.app.data.model.DownloadState
 import com.mangareader.app.data.model.DownloadedChapter
@@ -20,9 +23,18 @@ import org.json.JSONObject
 import java.io.File
 import java.util.UUID
 
-class DownloadRepository(private val context: Context) {
+class DownloadRepository(
+    private val context: Context,
+    private val downloadedChapterDao: DownloadedChapterDao =
+        MangaDatabase.getInstance(context).downloadedChapterDao()
+) {
 
-    private val workManager = WorkManager.getInstance(context)
+    private val workManager: WorkManager by lazy { WorkManager.getInstance(context) }
+
+    val downloadedChaptersFlow: Flow<List<DownloadedChapter>> =
+        downloadedChapterDao.observeAll().map { entities ->
+            entities.map { it.toDomain() }
+        }
 
     fun startDownload(chapter: Chapter): UUID {
         val constraints = Constraints.Builder()
@@ -92,59 +104,79 @@ class DownloadRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Synchronisiert die auf der Festplatte gespeicherten Offline-Kapitel mit Room,
+     * sodass sowohl bestehende als auch neue Downloads reaktiv per Flow verfügbar sind.
+     */
+    suspend fun syncWithDisk(): List<DownloadedChapter> = withContext(Dispatchers.IO) {
+        val diskEntities = scanDiskDownloads(context.filesDir)
+        downloadedChapterDao.syncAll(diskEntities)
+        diskEntities.map { it.toDomain() }
+    }
+
     suspend fun getDownloadedChapters(): List<DownloadedChapter> = withContext(Dispatchers.IO) {
-        val baseDir = File(context.filesDir, "manga_downloads")
-        if (!baseDir.exists() || !baseDir.isDirectory) return@withContext emptyList()
-
-        val chapters = mutableListOf<DownloadedChapter>()
-        baseDir.listFiles()?.forEach { dir ->
-            if (dir.isDirectory) {
-                val metaFile = File(dir, "metadata.json")
-                if (metaFile.exists()) {
-                    try {
-                        val json = JSONObject(metaFile.readText())
-                        val id = json.optString("id", dir.name)
-                        val title = json.optString("title", dir.name)
-                        val sourceUrl = json.optString("sourceUrl", "")
-                        val timestamp = json.optLong("timestamp", dir.lastModified())
-                        
-                        val imageFiles = mutableListOf<String>()
-                        val filesArr = json.optJSONArray("files")
-                        if (filesArr != null) {
-                            for (i in 0 until filesArr.length()) {
-                                imageFiles.add(filesArr.getString(i))
-                            }
-                        } else {
-                            dir.listFiles { _, name ->
-                                name.endsWith(".jpg") || name.endsWith(".png") || name.endsWith(".webp")
-                            }?.sortedBy { it.name }?.forEach { imageFiles.add(it.absolutePath) }
-                        }
-
-                        chapters.add(
-                            DownloadedChapter(
-                                id = id,
-                                title = title,
-                                sourceUrl = sourceUrl,
-                                imageFilePaths = imageFiles,
-                                downloadTimestamp = timestamp,
-                                totalPages = imageFiles.size
-                            )
-                        )
-                    } catch (e: Exception) {
-                        e.printStackTrace()
-                    }
-                }
-            }
+        val dbItems = downloadedChapterDao.getAll().map { it.toDomain() }
+        if (dbItems.isNotEmpty()) {
+            dbItems
+        } else {
+            syncWithDisk()
         }
-        chapters.sortedByDescending { it.downloadTimestamp }
     }
 
     suspend fun deleteChapter(chapterId: String): Boolean = withContext(Dispatchers.IO) {
         val dir = File(context.filesDir, "manga_downloads/$chapterId")
-        if (dir.exists()) {
-            dir.deleteRecursively()
-        } else {
-            false
+        val deletedDisk = if (dir.exists()) dir.deleteRecursively() else false
+        downloadedChapterDao.deleteById(chapterId)
+        deletedDisk
+    }
+
+    companion object {
+        fun scanDiskDownloads(filesDir: File): List<DownloadedChapterEntity> {
+            val baseDir = File(filesDir, "manga_downloads")
+            if (!baseDir.exists() || !baseDir.isDirectory) return emptyList()
+
+            val chapters = mutableListOf<DownloadedChapterEntity>()
+            baseDir.listFiles()?.forEach { dir ->
+                if (dir.isDirectory) {
+                    val metaFile = File(dir, "metadata.json")
+                    if (metaFile.exists()) {
+                        runCatching {
+                            val json = JSONObject(metaFile.readText())
+                            val id = json.optString("id", dir.name).ifBlank { dir.name }
+                            val title = json.optString("title", dir.name)
+                            val sourceUrl = json.optString("sourceUrl", "")
+                            val timestamp = json.optLong("timestamp", dir.lastModified())
+
+                            val imageFiles = mutableListOf<String>()
+                            val filesArr = json.optJSONArray("files")
+                            if (filesArr != null) {
+                                for (i in 0 until filesArr.length()) {
+                                    val path = filesArr.optString(i, "")
+                                    if (path.isNotBlank()) imageFiles.add(path)
+                                }
+                            } else {
+                                dir.listFiles { _, name ->
+                                    name.endsWith(".jpg", ignoreCase = true) ||
+                                        name.endsWith(".png", ignoreCase = true) ||
+                                        name.endsWith(".webp", ignoreCase = true)
+                                }?.sortedBy { it.name }?.forEach { imageFiles.add(it.absolutePath) }
+                            }
+
+                            chapters.add(
+                                DownloadedChapterEntity(
+                                    id = id,
+                                    title = title,
+                                    sourceUrl = sourceUrl,
+                                    imageFilePaths = imageFiles,
+                                    downloadTimestamp = timestamp,
+                                    totalPages = imageFiles.size
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+            return chapters.sortedByDescending { it.downloadTimestamp }
         }
     }
 }

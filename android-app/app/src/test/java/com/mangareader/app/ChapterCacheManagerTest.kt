@@ -1,7 +1,16 @@
 package com.mangareader.app
 
+import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import com.mangareader.app.data.cache.ChapterCacheManager
+import com.mangareader.app.data.settings.SettingsDataStore
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -108,5 +117,49 @@ class ChapterCacheManagerTest {
         assertFalse(f2.exists())
         assertFalse(f3.exists())
         assertTrue(journal.exists())
+    }
+
+    @Test
+    fun `binds reactively to SettingsDataStore cache limit flow and updates statsFlow`() = runBlocking {
+        val cacheRoot = tempFolder.newFolder("cacheBind")
+        val imgDir = File(cacheRoot, "image_cache").apply { mkdirs() }
+        File(imgDir, "page1.bin").writeBytes(ByteArray(1024))
+
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val ds = PreferenceDataStoreFactory.create(
+                scope = scope,
+                produceFile = { File(tempFolder.newFolder(), "cache_bind.preferences_pb") }
+            )
+            val settingsStore = SettingsDataStore(ds)
+            val manager = ChapterCacheManager(
+                cacheRootDir = cacheRoot,
+                managedDirectories = listOf(imgDir)
+            )
+
+            val updated8Gb = CompletableDeferred<Long>()
+            val bindJob = manager.bindToLimitFlow(
+                scope = scope,
+                limitBytesFlow = settingsStore.cacheLimitBytesFlow,
+                pruneOnChange = true,
+                onPruned = {
+                    val currentLimit = manager.getMaxSizeBytes()
+                    if (currentLimit == ChapterCacheManager.mbToBytes(8192) && !updated8Gb.isCompleted) {
+                        updated8Gb.complete(currentLimit)
+                    }
+                }
+            )
+
+            settingsStore.updateCacheLimitMb(8192)
+            val applied = withTimeout(5_000L) { updated8Gb.await() }
+            assertEquals(8L * 1024L * 1024L * 1024L, applied)
+            assertEquals(applied, manager.maxSizeBytesFlow.first())
+            assertEquals(applied, manager.statsFlow.value.maxBytes)
+            assertEquals(1024L, manager.statsFlow.value.totalBytes)
+
+            bindJob.cancel()
+        } finally {
+            scope.cancel()
+        }
     }
 }

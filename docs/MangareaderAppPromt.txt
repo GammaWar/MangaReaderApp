@@ -1,0 +1,6 @@
+Erstelle eine Android-App in Kotlin und Jetpack Compose mit einer zentralen WebView. Die App soll ein Eingabefeld für URLs besitzen, damit man direkt zu Kapitel-Websites navigieren oder URLs hineinkopieren kann[1][2]. Implementiere eine JavaScript-Extraction-Funktion, die auf Knopfdruck alle Bild-URLs (.jpg, .png, .webp) der aktuellen Seite ausliest. Wenn diese Bilder extrahiert sind, soll die App in einen nativen Manga/Manhua-Reader umschalten. Integriere zudem einen Download-Manager (mit WorkManager), der diese extrahierten Bild-URLs im Hintergrund herunterlädt und für das Offline-Lesen speichert.
+
+Erstelle für den Reader eine 'Nächstes Kapitel'-Funktion. Da die App URLs über eine WebView einbindet, soll die App beim Erreichen des Kapitelendes (oder auf Klick des Next-Buttons im Reader) entweder:
+Per JavaScript den 'Next Chapter'-Link auf der originalen Website identifizieren, dessen URL auslesen und direkt die neuen Bilder für den Reader extrahieren.
+Alternativ die URL-Struktur analysieren, um das Foljekapitel zu laden.
+Das Ziel ist ein nahtloser Übergang zum nächsten Kapitel im nativen Reader, ohne dass der Nutzer manuell zurück in den Browser-Modus wechseln muss.
